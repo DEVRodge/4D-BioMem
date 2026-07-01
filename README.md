@@ -194,7 +194,76 @@ recall_memory("用户有什么过敏史")
 | `LAMBDA` | `0.05` | 遗忘衰减因子 |
 | `THETA_PRUNE` | `0.5` | 剪枝权重阈值 |
 | `TAU` | `1.0` | 软检索激活阈值 |
+| `SEED` | `true` | 启动时是否灌入 8 条演示数据 |
 | `LOG_LEVEL` | `info` | 日志级别 |
+| | **客户端环境变量** | |
+| `BIOMEM_API_URL` | `http://localhost:8000` | 4D-BioMem 服务地址（客户端工具用） |
+| `BIOMEM_API_KEY` | 空 | API 鉴权 Key（与服务器 API_KEY 一致） |
+| `BIOMEM_DEFAULT_USER` | `hermes` | 默认用户 ID |
+
+---
+
+## 🤖 Hermes Agent 集成
+
+4D-BioMem 已原生支持 [Hermes Agent](https://github.com/DEVRodge/Hermes-Agent-Self-Evolution) 框架。安装方式：
+
+```bash
+# 在 Hermes Agent 的 tools 目录下已有 biomem_tool.py
+# 只需确保 4D-BioMem 服务在运行
+curl http://localhost:8000/health
+# → {"status":"ok", ...}
+```
+
+### 已注册的工具
+
+Hermes Agent 启动后，大模型自动可使用两个 4D-BioMem 工具：
+
+| 工具名称 | 功能 | 大模型何时调用 |
+|---------|------|-------------|
+| `biomem_remember` | 存入事实到长效记忆 | 用户说了需要跨会话记住的信息：过敏史、密码、偏好、项目方案等 |
+| `biomem_recall` | 检索历史记忆 | 用户引用过去讨论、需要检查过敏/禁忌、上下文窗口不够时 |
+
+### 记忆代谢闭环
+
+```
+用户说 "我对青霉素过敏" 
+  → Hermes 调 biomem_remember 
+    → 4D-BioMem 审计标记为 is_risk=True（永久锁定）
+      → 双通路检索时风险记忆始终强制返回 ✓
+
+用户说 "上次那个 Bug 怎么修"
+  → Hermes 调 biomem_recall
+    → 4D-BioMem 双通路唤醒 → 权重排序 Top-K → 返回结果
+      → 命中记忆 C_i+=1，突触强化，免于剪枝 ✓
+
+闲聊内容（"今天吃了酸菜鱼"）
+  → 低价值标记 is_risk=False, I=2
+    → 无人检索 → 权重衰减至 θ_prune 以下 → 物理抹除 ✓
+```
+
+### 使用方式
+
+**方式一：直接在 Hermes 对话中告知**
+```
+你对 Hermes 说：
+  → "从现在开始请用 biomem_remember 和 biomem_recall 工具管理我的长期记忆"
+之后 Hermes 的大模型就会自动判断何时存、何时查。
+```
+
+**方式二：环境变量配置**
+
+```bash
+export BIOMEM_API_URL=http://localhost:8000
+# 如果 4D-BioMem 开启了 API 鉴权（未配置则无需设此值）
+export BIOMEM_API_KEY=your-key
+```
+
+### 验证连通
+
+```bash
+# 说一句话让 Hermes 存，然后查 4D-BioMem：
+curl -s "http://localhost:8000/v1/memory/list" -G -d user_id=hermes | python3 -m json.tool
+```
 
 ---
 
@@ -267,13 +336,19 @@ python3 experiment/runner.py
 │   ├── main.py                  FastAPI 服务（6 路由 + 鉴权）
 │   └── static/index.html        暗黑科技风监控看板
 ├── integrations/
-│   └── hermes_tools.py          Hermes Agent 工具（remember_fact/recall_memory）
+│   └── hermes_tools.py          Hermes Agent 独立工具（httpx 直连）
 ├── experiment/                   A/B/C 三组对照组实验框架
 ├── test_core.py / test_storage.py / test_retrieval.py
 ├── test_api.py / run_benchmark.py
 ├── requirements.txt             依赖清单
 ├── Dockerfile / docker-compose.yml / .env.example
 └── SPEC.md                      技术规格说明书
+
+# Hermes Agent 集成文件（安装在 ~/.hermes/hermes-agent/tools/）
+~/.hermes/hermes-agent/
+├── tools/
+│   └── biomem_tool.py           4D-BioMem 工具（registry.register 注册）
+└── toolsets.py                  已添加 biomem_remember/recall 到核心工具集
 ```
 
 ---

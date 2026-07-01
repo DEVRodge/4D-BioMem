@@ -212,13 +212,15 @@ def create_app(
     db_path: str | None = None,
     vector_path: str | None = None,
     prefer_chroma: bool | None = None,
-    seed: bool = True,
+    seed: bool | None = None,
 ) -> FastAPI:
     # 优先用显式参数，否则从 config 环境变量读取
     db_path = db_path or settings.db_path
     vector_path = vector_path or settings.vector_path
     if prefer_chroma is None:
         prefer_chroma = settings.prefer_chroma
+    if seed is None:
+        seed = settings.seed
 
     state = AppState(db_path, vector_path, prefer_chroma, seed=seed)
 
