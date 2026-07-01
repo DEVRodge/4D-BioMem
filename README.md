@@ -117,6 +117,84 @@ C (BioMem)  : 10 -> 20 -> 30 -> 30 -> 50 -> 23   (剪枝后收敛)
 
 ---
 
+## 🔌 Embedding API 说明
+
+4D-BioMem 的**通路段 B（显意识语义检索）**依赖 Embedding API 将文本转换为高维向量，从而实现语义相似度匹配。
+
+### 默认模式（零配置运行）
+
+项目默认使用 **Mock 嵌入器**——基于 4-gram 哈希的确定性伪向量生成器，**无需任何 API Key、不依赖外部服务、不产生任何费用**。所有功能（包括检索、剪枝、看板）在 mock 模式下完整可用。
+
+```bash
+# 只需启动服务，无需任何额外配置
+docker compose up -d
+```
+
+> 但 mock 模式只能识别**关键词级别的匹配**（"项目 Alpha 的 Bug"和"项目 Alpha 的 Bug 修复方案"可以匹配），
+> 无法理解语义同义关系（"部署架构"和"k8s 加双活"无法自动关联）。
+
+### 开启真实 Embedding 后获得的能力
+
+| 能力 | Mock 模式 | 真实 Embedding |
+|------|:--------:|:-------------:|
+| 关键词精确匹配 | ✅ | ✅ |
+| 语义同义关联（"车"→"汽车"） | ❌ | ✅ |
+| 跨语言语义匹配 | ❌ | ✅ |
+| 长文本主题匹配 | ❌ | ✅ |
+| 搜索"部署架构"召回"k8s 双活" | ❌ | ✅ |
+| 外部依赖 | 零 | 需 API Key |
+
+### 配置方式
+
+```bash
+# 1. 填入 Embedding API Key（以 OpenAI 为例）
+OPENAI_API_KEY=sk-your-key-here
+
+# 2. 启动后自动生效，Mock 模式自动降级为后备
+```
+
+### Embedding API 厂家推荐
+
+| 厂家 | 模型 | 维度 | 国内可用 | 价格 | 语言支持 | 推荐场景 |
+|------|------|:---:|:------:|:---:|:-------:|--------|
+| **OpenAI** | `text-embedding-3-small` | 1536 | 需代理 | ~$0.02/1M tokens | 英文最佳，中文良好 | **首选，综合质量最高** |
+| **OpenAI** | `text-embedding-3-large` | 3072 | 需代理 | ~$0.13/1M tokens | 同上 | 高精度场景 |
+| **阿里通义千问** | `text-embedding-v2` | 1536 | ✅ | 百万 token 约 0.5元 | 中文最佳 | **国内用户首选，价格低** |
+| **百度文心** | `ERNIE-Bot-Embedding` | 384 | ✅ | 免费额度 50万t/月 | 中文最佳 | 百度云用户 |
+| **智谱 GLM** | `embedding-2` | 1024 | ✅ | 百万 token 约 1元 | 中文优秀 | 智谱生态用户 |
+| **硅基流动** | `BAAI/bge-m3` | 1024 | ✅ | 免费 | 多语言 | **免费首选，零成本接入** |
+| **Ollama 本地** | `nomic-embed-text` | 768 | ✅ | 免费 | 多语言良好 | **完全本地、零网络、保护隐私** |
+
+### 配置示例
+
+**OpenAI（首选，英文/通用场景）：**
+```bash
+LLM_BACKEND=openai
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+```
+
+**阿里通义千问（国内首选，中文场景）：**
+```bash
+LLM_BACKEND=openai
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx          # 阿里 DashScope API Key
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+OPENAI_EMBEDDING_MODEL=text-embedding-v2
+```
+
+**Ollama 本地部署（零网络、隐私保护）：**
+```bash
+# 先安装 Ollama 并拉取模型
+# ollama pull nomic-embed-text
+
+# 再启动 4D-BioMem（mock 模式下 Embedding 自动走本地 4-gram hash）
+# Ollama 集成将在后续版本提供原生支持
+```
+
+> **提示**：Embedding API 仅影响**通路 B（语义软检索）**的质量。通路段 A（风险常驻 + 任务/时间硬匹配）和剪枝算法完全在本地运行，不受 Embedding 影响。即使 Embedding API 不可用或降级，系统仍然完整可用。
+
+---
+
 ## 🚀 快速开始
 
 ### 方式一：Docker Compose 部署（推荐）
@@ -188,8 +266,11 @@ recall_memory("用户有什么过敏史")
 
 | 环境变量 | 默认值 | 说明 |
 |---------|--------|------|
-| `LLM_BACKEND` | `mock` | `mock` 零依赖模式 / `openai` 使用 OpenAI |
-| `OPENAI_API_KEY` | 空 | OpenAI Key（不填则自动用 mock） |
+| `LLM_BACKEND` | `mock` | `mock` 零依赖模式 / `openai` 使用 OpenAI 兼容 API |
+| `OPENAI_API_KEY` | 空 | OpenAI / 兼容 API Key（不填则自动用 mock） |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | API 地址（阿里云/硅基流动等填对应地址） |
+| `OPENAI_MODEL` | `gpt-4o-mini` | 审计用大模型 |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding 模型名 |
 | `API_KEY` | 空 | 服务鉴权 Key（空=不鉴权，适合内网） |
 | `DB_PATH` | `/data/biomem.db` | SQLite 数据库路径 |
 | `VECTOR_PATH` | `/data/vector_store` | 向量存储路径 |
