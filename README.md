@@ -10,6 +10,8 @@
 与传统的 Vanilla RAG（纯向量检索）或 Mem0/MemGPT 等摘要压缩方案不同，4D-BioMem 在**四维坐标空间**（时间 T / 任务特征 F / 风险规则 R / 语义向量 V）中管理记忆，通过**突触权重衰减**和**双通路唤醒**实现类人记忆的"自然遗忘"。
 
 ---
+<img width="1909" height="1009" alt="image" src="https://github.com/user-attachments/assets/1c7b0127-7738-4db1-9780-3e5142e20941" />
+可视化web控制台
 
 ## ✨ 核心特性
 
