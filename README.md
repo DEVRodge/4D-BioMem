@@ -1,0 +1,303 @@
+# 4D-BioMem · 智能体长效记忆系统
+
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688.svg)](https://fastapi.tiangolo.com/)
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](https://www.docker.com/)
+
+**4D-BioMem** 是一个受生物突触机制启发的 Agent 长效记忆系统。它模拟人脑的"新陈代谢"——记忆有强弱之分，高频使用的记忆被强化，低频噪声被物理抹除，安全底线永久锁定。
+
+与传统的 Vanilla RAG（纯向量检索）或 Mem0/MemGPT 等摘要压缩方案不同，4D-BioMem 在**四维坐标空间**（时间 T / 任务特征 F / 风险规则 R / 语义向量 V）中管理记忆，通过**突触权重衰减**和**双通路唤醒**实现类人记忆的"自然遗忘"。
+
+---
+
+## ✨ 核心特性
+
+### 四维记忆空间 M=(T,F,R,V)
+
+| 维度 | 含义 | 作用 |
+|------|------|------|
+| **T** - Timeline | 时间线索 | 记忆热度随时间自然衰减，太久没唤醒就变弱 |
+| **F** - Feature | 动态任务标签 | LLM 提取的半结构化标签（项目名、类型），用于硬过滤 |
+| **R** - Risk & Rule | 风险/生存本能 | **永久锁定**——如过敏史、密码等，豁免剪枝 |
+| **V** - Vector Space | 高维语义向量 | 在极小候选集内做相似度软匹配，根本消除噪音 |
+
+### 突触剪枝遗忘机制（Synaptic Pruning）
+
+权重衰减公式：
+
+$$W_i(t) = \begin{cases} \infty & \text{if } R_i = 1 \\ I_i \cdot \ln(1 + C_i) \cdot e^{-\lambda \cdot \Delta t_i} & \text{if } R_i = 0 \end{cases}$$
+
+| 符号 | 含义 |
+|------|------|
+| $R_i$ | 风险标记（1=永久锁定，0=动态遗忘） |
+| $I_i$ | LLM 评估的初始显性强度 [1, 10] |
+| $C_i$ | 被检索唤醒的总次数 |
+| $\lambda$ | 遗忘衰减因子 |
+| $\Delta t_i$ | 距离上次唤醒的时间 |
+
+当 $W_i(t) < \theta_{\text{prune}}$ 时，该记忆被**物理不可逆抹除**。
+
+### 双通路记忆唤醒架构
+
+| 通路 | 触发 | 耗时 | 方式 |
+|------|------|------|------|
+| **潜意识反射链** | 被动触发，毫秒级 | 低 | 时间流 + 风险规则硬匹配，风险记忆强制常驻 Prompt |
+| **显意识搜索链** | 面对复杂任务，主动调用 | 高 | 高维语义向量相似度 × 权重加成，Top-K 召回 |
+
+**激活阈值 τ**：`hard_confidence < τ` 时才升级到软检索，定量刻画"潜意识够用则不调用显意识"的算力调配边界。
+
+---
+
+## 📊 实验数据（对照组三组横向对比）
+
+50 条标注语料（风险=6 / 技术=17 / 闲聊=27），地面真值查询 5 条，剪枝阈值 θ=0.5：
+
+| 指标 | A: Vanilla RAG | B: FIFO+摘要 | C: **4D-BioMem** |
+|------|:---:|:---:|:---:|
+| **高危召回率 Risk Recall** | 100.0% | 100.0% | **100.0%** |
+| **语义检索 Precision@K** | 100.0% | 100.0% | **40.0%** * |
+| **上下文噪声比 Noise=闲聊** | 20.0% | 20.0% | **0.0%** |
+| **存储收敛**  | 50→50 (线性) | 50→50 (有界) | **50→23 (收敛)** |
+| **累计物理抹除** | 0 | 0 | **27 条闲聊** |
+
+> \* Precision@K 40% 是因为双通路检索的融合打分在多相似记忆时推挤了精确匹配项，是当前设计的一个可优化点。
+
+**存储收敛曲线**——C 组在 30 天模拟衰减后，全部 27 条闲聊被物理抹除，库从 50 急剧收敛到 23：
+
+```
+A (RAG)     : 10 -> 20 -> 30 -> 40 -> 50 -> 50   (线性增长，无回落)
+B (SW+摘要)  : 10 -> 20 -> 30 -> 40 -> 50 -> 50   (有界于 N=100)
+C (BioMem)  : 10 -> 20 -> 30 -> 30 -> 50 -> 23   (剪枝后收敛)
+```
+
+**30 轮加速衰减评测**（30 天模拟，casual I=2 → 0.31 < 0.5，tech I=7 → 1.08 > 0.5）：
+
+| 指标 | 结果 |
+|------|:----:|
+| 高危召回率 (Risk Recall) | **100%** |
+| 上下文噪声抑制比 | **18/18 = 100%** |
+| 存储空间收敛度 (Pickle) | 27555B → 15201B, **缩减 44.8%** |
+| 技术记忆存活率 | **10/10 = 100%** |
+
+---
+
+## 🏗️ 系统架构
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │          Hermes Agent / 客户端           │
+                    │   integrations/hermes_tools.py           │
+                    │   remember_fact / recall_memory          │
+                    └────────────────┬────────────────────────┘
+                                     │ HTTP (httpx)
+                    ┌────────────────▼────────────────────────┐
+                    │         API 层 (FastAPI)                 │
+                    │   POST /v1/memory/add  (异步录入)        │
+                    │   POST /v1/memory/retrieve (双通路检索)   │
+                    │   POST /v1/memory/prune (新陈代谢)        │
+                    │   GET  /v1/monitor/cells                 │
+                    │   GET  /dashboard/  (可视化看板)          │
+                    └────────────────┬────────────────────────┘
+                                     │
+          ┌──────────────────────────┼──────────────────────────┐
+          │                          │                          │
+   ┌──────▼──────┐          ┌───────▼───────┐          ┌───────▼───────┐
+   │  算法层      │          │  存储层        │          │  LLM 审计     │
+   │ memory_cell │          │  DBManager    │          │  OpenAI/Mock  │
+   │ Synaptic-   │          │  SQLite 元数据 │          │  Embedding    │
+   │ Pruning     │          │  向量库(pkl)   │          │  风险检测     │
+   │ Dual-       │          │  Dual-Write   │          │  标签提取     │
+   │ Pathway     │          │  Dual-Delete  │          │  强度评分     │
+   │ Retrieve    │          │               │          │               │
+   └─────────────┘          └───────────────┘          └───────────────┘
+```
+
+---
+
+## 🚀 快速开始
+
+### 方式一：Docker Compose 部署（推荐）
+
+```bash
+# 1. 克隆项目
+git clone https://github.com/your-username/4D-BioMem.git
+cd 4D-BioMem
+
+# 2. 配置（可选：设一个 API Key 保护服务）
+cp .env.example .env
+# 编辑 .env 设置 API_KEY，留空则不启用鉴权
+
+# 3. 启动
+docker compose up -d
+
+# 4. 验证
+curl http://localhost:8000/health
+```
+
+### 方式二：直接运行
+
+```bash
+pip install -r requirements.txt
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+### 方式三：局域网二机部署
+
+**服务器（运行 4D-BioMem 服务）：**
+
+```bash
+cp .env.example .env
+# 编辑 .env: API_KEY=my-secret
+docker compose up -d
+```
+
+**Hermes 客户端（调用记忆工具）：**
+
+```bash
+# 从服务器复制工具文件
+scp user@server:/path/4D-BioMem/integrations/hermes_tools.py .
+scp user@server:/path/4D-BioMem/integrations/__init__.py .
+
+pip install httpx
+export BIOMEM_API_URL=http://server-ip:8000
+export BIOMEM_API_KEY=my-secret
+```
+
+在 Python 中使用：
+
+```python
+from integrations import configure, remember_fact, recall_memory
+
+configure(base_url="http://192.168.1.100:8000", api_key="my-secret")
+
+# 存入记忆
+remember_fact("用户说他青霉素过敏，开药要避开")
+# → {"status": "queued", ...}
+
+# 检索记忆
+recall_memory("用户有什么过敏史")
+# → {"hits": [{"content": "用户说他青霉素过敏...", "is_risk": True, ...}], ...}
+```
+
+---
+
+## 🔧 配置参考
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `LLM_BACKEND` | `mock` | `mock` 零依赖模式 / `openai` 使用 OpenAI |
+| `OPENAI_API_KEY` | 空 | OpenAI Key（不填则自动用 mock） |
+| `API_KEY` | 空 | 服务鉴权 Key（空=不鉴权，适合内网） |
+| `DB_PATH` | `/data/biomem.db` | SQLite 数据库路径 |
+| `VECTOR_PATH` | `/data/vector_store` | 向量存储路径 |
+| `LAMBDA` | `0.05` | 遗忘衰减因子 |
+| `THETA_PRUNE` | `0.5` | 剪枝权重阈值 |
+| `TAU` | `1.0` | 软检索激活阈值 |
+| `LOG_LEVEL` | `info` | 日志级别 |
+
+---
+
+## 📡 API 接口
+
+所有 `/v1/` 接口受 `X-API-Key` 头部保护（若配置了 `API_KEY`）。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/health` | 健康检查（免鉴权） |
+| `POST` | `/v1/memory/add` | 异步录入记忆（立即返回 queued） |
+| `GET` | `/v1/memory/list` | 列出用户全部记忆 |
+| `POST` | `/v1/memory/retrieve` | 双通路唤醒检索 |
+| `POST` | `/v1/memory/prune` | 触发新陈代谢——抹除死亡记忆 |
+| `GET` | `/v1/monitor/cells` | 全量细胞实时监控 |
+| `POST` | `/v1/monitor/system_status` | 系统整体指标 |
+| `GET` | `/dashboard/` | 可视化监控面板 |
+
+---
+
+## 🧪 测试
+
+所有里程碑回归测试：
+
+```bash
+# M1 - 剪枝算法
+python3 test_core.py
+
+# M2 - 存储双后端
+python3 test_storage.py
+
+# M3 - 双通路检索
+python3 test_retrieval.py
+
+# API - 端到端
+python3 test_api.py
+
+# 科学评测 - 30 轮
+python3 run_benchmark.py
+
+# 对照组横向对比
+python3 experiment/runner.py
+```
+
+---
+
+## 🖥️ 可视化监控面板
+
+启动服务后访问 `http://localhost:8000/dashboard/`：
+
+- **实时权重列表**——每条记忆的权重、频次、距上次唤醒时间
+- **一键新陈代谢**——加速衰减，看闲聊记忆"灰飞烟灭"动画
+- **ECharts 实时图表**——记忆构成饼图 + 权重分布对数柱状图
+- **系统指标卡片**——有效记忆数、风险锁定率、今日剪枝数
+
+---
+
+## 📁 项目结构
+
+```
+4D-BioMem/
+├── config.py                   配置管理
+├── core/
+│   ├── memory_cell.py          MemoryCell + SynapticPruningEngine
+│   ├── retrieval.py             DualPathwayRetriever（双通路检索）
+│   └── llm_auditor.py           OpenAILLMAuditor + Mock（自动降级）
+├── storage/
+│   └── db_manager.py            DBManager（SQLite + 向量库，线程安全）
+├── api/
+│   ├── main.py                  FastAPI 服务（6 路由 + 鉴权）
+│   └── static/index.html        暗黑科技风监控看板
+├── integrations/
+│   └── hermes_tools.py          Hermes Agent 工具（remember_fact/recall_memory）
+├── experiment/                   A/B/C 三组对照组实验框架
+├── test_core.py / test_storage.py / test_retrieval.py
+├── test_api.py / run_benchmark.py
+├── requirements.txt             依赖清单
+├── Dockerfile / docker-compose.yml / .env.example
+└── SPEC.md                      技术规格说明书
+```
+
+---
+
+## 依赖
+
+**仅 5 个必要依赖**（零外部 AI 依赖即可运行）：
+
+```
+fastapi>=0.138.0
+uvicorn>=0.49.0
+numpy>=1.24.0
+openai>=1.0.0       # 可选（仅 LLM_BACKEND=openai 时需要）
+httpx>=0.28.0       # 仅客户端工具需要
+```
+
+---
+
+## 📜 许可证
+
+MIT
+
+---
+
+## 🙏 致谢
+
+本项目受生物突触可塑性（Synaptic Plasticity）和记忆衰退理论启发，旨在为大语言模型 Agent 提供一个更接近人脑记忆机制的长效记忆解决方案。

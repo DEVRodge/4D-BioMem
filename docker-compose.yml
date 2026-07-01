@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  biomem:
+    build: .
+    container_name: 4d-biomem
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - biomem_data:/data
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; r=urllib.request.urlopen('http://localhost:8000/health'); assert r.status == 200"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  biomem_data:
+    driver: local
