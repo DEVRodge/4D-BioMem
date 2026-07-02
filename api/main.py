@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from config import settings
+from core.retrieval import _tags_overlap
 from core.llm_auditor import OpenAIEmbedder, OpenAILLMAuditor, MockEmbedder, MockLLMAuditor
 from core.memory_cell import RISK_LOCKED_WEIGHT, MemoryCell, SynapticPruningEngine
 from storage.db_manager import DBManager
@@ -77,7 +78,7 @@ class AppState:
         else:
             self.auditor = MockLLMAuditor()
             self.embedder = MockEmbedder()
-        self.write_queue: asyncio.Queue[tuple[str, str, str]] | None = None
+        self.write_queue: asyncio.Queue[tuple[str, str, str, dict | None]] | None = None
         self._worker_task: asyncio.Task | None = None
         self._stop = False
         # 剪枝计数（监控指标用）
@@ -143,21 +144,23 @@ class AppState:
     async def shutdown(self) -> None:
         self._stop = True
         if self.write_queue is not None:
-            await self.write_queue.put(("__stop__", "", ""))
+            await self.write_queue.put(("__stop__", "", "", None))
         if self._worker_task is not None:
             await self._worker_task
         if self.db is not None:
             self.db.close()
 
     async def _ingestion_worker(self) -> None:
-        """后台消费者：从队列取 (req_id, user_id, content)，跑审计 → save_memory。"""
+        """后台消费者：从队列取 (req_id, user_id, content, user_tags)，跑审计 → save_memory。"""
         assert self.db is not None and self.write_queue is not None
         while not self._stop:
-            req_id, user_id, content = await self.write_queue.get()
+            req_id, user_id, content, user_tags = await self.write_queue.get()
             if req_id == "__stop__":
                 break
             try:
                 audit = await self.auditor.audit(content)
+                # 合并标签：调用方显式传入的 task_tags 优先于自动提取
+                final_tags = {**audit["task_tags"], **(user_tags or {})}
                 vector = await self.embedder.embed(content)
                 now = datetime.now(tz=timezone.utc)
                 cell = MemoryCell(
@@ -169,7 +172,7 @@ class AppState:
                     access_count=1,
                     created_at=now,
                     last_accessed_at=now,
-                    task_tags=audit["task_tags"],
+                    task_tags=final_tags,
                     id=str(uuid.uuid4()),
                 )
                 cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
@@ -188,12 +191,14 @@ class AppState:
 class AddRequest(BaseModel):
     user_id: str
     content: str
+    task_tags: dict | None = None
 
 
 class RetrieveRequest(BaseModel):
     user_id: str
     query: str
     top_k: int = Field(default=5, ge=1, le=50)
+    query_tags: dict | None = None  # F 轴过滤：指定则通路A仅返回标签匹配的非风险记忆
 
 
 class PruneRequest(BaseModel):
@@ -233,7 +238,7 @@ def create_app(
         finally:
             await state.shutdown()
 
-    app = FastAPI(title="4D-BioMem API", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="4D-BioMem API", version="1.1.0", lifespan=lifespan)
     app.state.state = state
     _register_routes(app, state)
     # 前端看板静态资源挂载在 /dashboard（访问 /dashboard 即打开 index.html）
@@ -267,7 +272,7 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
         if state.db is None or state.write_queue is None:
             raise HTTPException(503, "service not ready")
         request_id = str(uuid.uuid4())
-        await state.write_queue.put((request_id, req.user_id, req.content))
+        await state.write_queue.put((request_id, req.user_id, req.content, req.task_tags))
         return {"status": "queued", "message": "Memory ingestion started.", "request_id": request_id}
 
     @app.get("/v1/memory/list", dependencies=[Depends(verify_api_key)])
@@ -313,6 +318,9 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
         risk_cells = [c for c in cells if c.is_risk]
         pathway_a: dict[str, MemoryCell] = {}
         for c in recent:
+            if req.query_tags and not c.is_risk:
+                if not _tags_overlap(c.task_tags, req.query_tags):
+                    continue
             pathway_a[c.id] = c
         for c in risk_cells:
             pathway_a[c.id] = c

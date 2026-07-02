@@ -4,6 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](https://www.docker.com/)
+[![Version](https://img.shields.io/badge/release-v1.1.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.1.0)
 
 **4D-BioMem** 是一个受生物突触机制启发的 Agent 长效记忆系统。它模拟人脑的"新陈代谢"——记忆有强弱之分，高频使用的记忆被强化，低频噪声被物理抹除，安全底线永久锁定。
 
@@ -357,13 +358,38 @@ curl -s "http://localhost:8000/v1/memory/list" -G -d user_id=hermes | python3 -m
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/health` | 健康检查（免鉴权） |
-| `POST` | `/v1/memory/add` | 异步录入记忆（立即返回 queued） |
+| `POST` | `/v1/memory/add` | 异步录入记忆（立即返回 queued），支持 `task_tags` 字段 |
 | `GET` | `/v1/memory/list` | 列出用户全部记忆 |
-| `POST` | `/v1/memory/retrieve` | 双通路唤醒检索 |
+| `POST` | `/v1/memory/retrieve` | 双通路唤醒检索，支持 `query_tags` F 轴过滤 |
 | `POST` | `/v1/memory/prune` | 触发新陈代谢——抹除死亡记忆 |
 | `GET` | `/v1/monitor/cells` | 全量细胞实时监控 |
 | `POST` | `/v1/monitor/system_status` | 系统整体指标 |
 | `GET` | `/dashboard/` | 可视化监控面板 |
+
+#### 写入带标签的记忆
+
+```bash
+curl -X POST http://localhost:8000/v1/memory/add \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "hermes",
+    "content": "4D-BioMem F 轴过滤支持项目级别隔离",
+    "task_tags": {"project": "4D-BioMem", "type": "tech"}
+  }'
+```
+
+#### 按标签过滤检索
+
+```bash
+# 只返回 project=4D-BioMem 的记忆（通路 A 过滤）
+curl -X POST http://localhost:8000/v1/memory/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "hermes",
+    "query": "F 轴过滤",
+    "query_tags": {"project": "4D-BioMem"}
+  }'
+```
 
 ---
 
@@ -447,6 +473,20 @@ numpy>=1.24.0
 openai>=1.0.0       # 可选（仅 LLM_BACKEND=openai 时需要）
 httpx>=0.28.0       # 仅客户端工具需要
 ```
+
+---
+
+## 📋 更新日志
+
+### v1.1.0 (2026-07-02) — F 轴标签过滤
+
+**新增特性**
+- `POST /v1/memory/add` 支持可选 `task_tags` 字段：调用方可显式传入标签（如 `{"project": "4D-BioMem", "type": "tech"}`），与 LLM 自动提取的标签合并写入
+- `POST /v1/memory/retrieve` 支持可选 `query_tags` 字段：通路 A 的非风险记忆只召回标签匹配的条目，实现 F 轴硬过滤
+- 向后完全兼容：不传 `task_tags`/`query_tags` 时行为与 v1.0.0 一致
+
+**变更文件**
+- `api/main.py`: AddRequest + RetrieveRequest 增加标签字段，写入管线合并用户标签与自动标签，检索管线应用 `_tags_overlap` 过滤
 
 ---
 
