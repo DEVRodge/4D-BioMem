@@ -53,6 +53,19 @@ curl -s -X POST http://localhost:8000/v1/memory/add \
   -d '{"user_id":"hermes","content":"[项目进展] 这里写上里程碑/任务完成情况和状态"}'
 ```
 
+### 版本发布标准流程
+
+每次迭代发版必须按顺序执行以下步骤：
+
+1. **改版本号** — `api/main.py` 中 `FastAPI(title="4D-BioMem API", version="X.Y.Z", ...)`
+2. **改 README** — 更新版本徽章、更新日志、API 文档（如有新增接口）
+3. **git commit** — `git add` 改动的文件 → `git commit`
+4. **git tag** — `git tag -a vX.Y.Z -m "消息" && git push origin vX.Y.Z`
+5. **gh release** — `gh release create vX.Y.Z --title "vX.Y.Z — ..." --notes "..."`（**不要漏**，`git tag` 不给 GitHub Releases 页面加描述）
+6. **Docker** — `docker compose build && docker tag 4d-biomem-biomem:latest 4d-biomem:vX.Y.Z && docker compose up -d --force-recreate`
+
+> 步骤 4 和 5 是两个不同操作，**必须都做**：`git tag -a` 只创建代码标签，`gh release create` 才生成 Releases 页面。
+
 ### 信息类型前缀规范
 
 | 前缀 | 用途 | 示例 |
