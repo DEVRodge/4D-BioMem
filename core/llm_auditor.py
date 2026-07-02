@@ -199,8 +199,11 @@ class MockLLMAuditor:
         # 项目名（中文或英文，跟在"项目"后面）
         for m in re.finditer(r"项目\s*([A-Za-z0-9_\-一-鿿]+)", content):
             entities.append({"name": m.group(1), "type": "project", "role": "subject"})
-        # 人名（跟在"用户"或"开发者"或"负责人"后面）
-        for m in re.finditer(r"(?:用户|开发者|owner|负责人)[：:\s]*([A-Za-z0-9_\-一-鿿]{2,})", content):
+        # 人名（跟在"用户"或"开发者"或"负责人"后面，限2-4个汉字）
+        for m in re.finditer(r"(?:用户|开发者|负责人)[：:\s]*([一-鿿]{2,4})(?=[\s，。、的负是会在]|$)", content):
+            entities.append({"name": m.group(1), "type": "person", "role": "owner"})
+        # 英文名（跟在 owner: 后面）
+        for m in re.finditer(r"owner[：:\s]*([A-Za-z_][A-Za-z0-9_]{1,20})", content):
             entities.append({"name": m.group(1), "type": "person", "role": "owner"})
         # 版本号
         for m in re.finditer(r"v?(\d+\.\d+(?:\.\d+)?)", content):
