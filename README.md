@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](https://www.docker.com/)
-[![Version](https://img.shields.io/badge/release-v1.1.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.1.0)
+[![Version](https://img.shields.io/badge/release-v1.2.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.2.0)
 
 **4D-BioMem** 是一个受生物突触机制启发的 Agent 长效记忆系统。它模拟人脑的"新陈代谢"——记忆有强弱之分，高频使用的记忆被强化，低频噪声被物理抹除，安全底线永久锁定。
 
@@ -360,7 +360,8 @@ curl -s "http://localhost:8000/v1/memory/list" -G -d user_id=hermes | python3 -m
 | `GET` | `/health` | 健康检查（免鉴权） |
 | `POST` | `/v1/memory/add` | 异步录入记忆（立即返回 queued），支持 `task_tags` 字段 |
 | `GET` | `/v1/memory/list` | 列出用户全部记忆 |
-| `POST` | `/v1/memory/retrieve` | 双通路唤醒检索，支持 `query_tags` F 轴过滤 |
+| `POST` | `/v1/memory/retrieve` | 双通路唤醒检索，支持 `query_tags` F 轴过滤、`query_entities` 实体 boost、`agent_id` 隔离 |
+| `POST` | `/v1/memory/synthesize` | 跨记忆合成问答：检索 Top-K → LLM 综合回答（Mock 模式返回拼接摘要） |
 | `POST` | `/v1/memory/prune` | 触发新陈代谢——抹除死亡记忆 |
 | `GET` | `/v1/monitor/cells` | 全量细胞实时监控 |
 | `POST` | `/v1/monitor/system_status` | 系统整体指标 |
@@ -388,6 +389,44 @@ curl -X POST http://localhost:8000/v1/memory/retrieve \
     "user_id": "hermes",
     "query": "F 轴过滤",
     "query_tags": {"project": "4D-BioMem"}
+  }'
+```
+
+#### 按实体 boost 检索
+
+```bash
+# 命中所查实体的记忆 score 提升（25%~2x）
+curl -X POST http://localhost:8000/v1/memory/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "hermes",
+    "query": "Alpha 项目",
+    "query_entities": [{"name": "Alpha", "type": "project"}]
+  }'
+```
+
+#### 按 agent 隔离检索
+
+```bash
+# 只检索 Hermes agent 写入的记忆
+curl -X POST http://localhost:8000/v1/memory/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "hermes",
+    "query": "交易偏好",
+    "agent_id": "hermes"
+  }'
+```
+
+#### 跨记忆合成问答
+
+```bash
+curl -X POST http://localhost:8000/v1/memory/synthesize \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "hermes",
+    "question": "关于项目 Alpha 我们有哪些信息？",
+    "query_entities": [{"name": "Alpha", "type": "project"}]
   }'
 ```
 
@@ -477,6 +516,23 @@ httpx>=0.28.0       # 仅客户端工具需要
 ---
 
 ## 📋 更新日志
+
+### v1.2.0 (2026-07-02) — 实体提取 + 多 Agent 隔离 + 跨记忆合成
+
+**新增特性**
+- **实体提取**：Mock 和 OpenAI 审计器在写入时自动提取结构化实体（项目名、人名、版本号、技术术语），按 `{"name", "type", "role"}` 格式持久化。检索时可选 `query_entities` 做 score boost（25%~2x）
+- **多 Agent 隔离**：`POST /v1/memory/add` 支持 `agent_id` 参数，写入时标注来源。`POST /v1/memory/retrieve` 支持 `agent_id` 过滤，只检索指定 agent 的记忆。不传时行为不变（全量混合检索）
+- **跨记忆合成**：新增 `POST /v1/memory/synthesize` 端点，内部检索 Top-K 记忆，OpenAI 路径自动 LLM 综合回答，Mock 路径返回拼接摘要
+- **检索增强**：通路 B 增加实体重叠 score boost 公式 `score = sim * log(1+w) * entity_boost`。检索响应新增 `entities`、`task_tags`、`agent_id` 字段
+- **代码重构**：提取 `_retrieve_hits` 共享辅助函数，消除 retrieve 和 synthesize 之间的代码重复
+- **Hermes 工具**：`recall_memory` 支持 `query_entities`、`agent_id` 参数。新增 `synthesize_memory` 工具
+
+**变更文件**
+- `core/memory_cell.py`: MemoryCell 增加 `entities` 字段
+- `core/llm_auditor.py`: Mock + OpenAI 审计器增加实体提取
+- `storage/db_manager.py`: 新增 `entities` 列（含自动迁移）、序列化/反序列化
+- `api/main.py`: 新增 `SynthesizeRequest`、`_retrieve_hits` 辅助函数、`/v1/memory/synthesize` 端点；所有路由支持 `agent_id` 过滤与字段返回
+- `integrations/hermes_tools.py`: 新增 `synthesize_memory` 工具，`recall_memory` 增加可选参数
 
 ### v1.1.0 (2026-07-02) — F 轴标签过滤
 

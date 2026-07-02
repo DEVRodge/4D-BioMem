@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS memory_cells (
     content          TEXT NOT NULL,
     vector_id        TEXT NOT NULL,
     task_tags        TEXT,                 -- JSON 字符串
+    entities         TEXT DEFAULT '[]',    -- JSON 实体列表
     is_risk          INTEGER NOT NULL,     -- 0 / 1
     base_intensity   REAL NOT NULL,        -- I_i ∈ [1, 10]
     access_count     INTEGER NOT NULL,     -- C_i
@@ -178,10 +179,10 @@ CREATE TABLE IF NOT EXISTS memory_cells (
 
 _INSERT_SQL = """
 INSERT OR REPLACE INTO memory_cells
-    (id, user_id, agent_id, content, vector_id, task_tags,
+    (id, user_id, agent_id, content, vector_id, task_tags, entities,
      is_risk, base_intensity, access_count,
      created_at, last_accessed_at, current_weight)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -221,7 +222,15 @@ class DBManager:
         self._conn.commit()
         # 默认走轻量 NumpyVectorStore（零额外依赖）；显式 prefer_chroma=True 才启用 chromadb
         self.vector_store: VectorStore = _make_vector_store(vector_path, prefer_chroma)
+        self._migrate()
         self._closed = False
+
+    def _migrate(self) -> None:
+        """为新列做 ALTER TABLE（SQLite 的 CREATE TABLE IF NOT EXISTS 不会追加列）。"""
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(memory_cells)")}
+        if "entities" not in columns:
+            self._conn.execute("ALTER TABLE memory_cells ADD COLUMN entities TEXT DEFAULT '[]'")
+            self._conn.commit()
 
     # ---- Dual-Write --------------------------------------------------------
 
@@ -235,6 +244,7 @@ class DBManager:
         # vector_id 对齐为 cell.id，保证 Dual-Delete 主键统一
         cell.vector_id = cell.id
         tags_json = json.dumps(cell.task_tags, ensure_ascii=False)
+        entities_json = json.dumps(cell.entities, ensure_ascii=False)
         row = (
             cell.id,
             cell.user_id,
@@ -242,6 +252,7 @@ class DBManager:
             cell.content,
             cell.vector_id,
             tags_json,
+            entities_json,
             int(cell.is_risk),
             float(cell.base_intensity),
             int(cell.access_count),
@@ -281,12 +292,14 @@ class DBManager:
     def _row_to_cell(self, r: sqlite3.Row) -> MemoryCell:
         """sqlite3.Row -> MemoryCell（共享反序列化逻辑）。"""
         tags = json.loads(r["task_tags"]) if r["task_tags"] else {}
+        entities = json.loads(r["entities"]) if "entities" in r.keys() and r["entities"] else []
         return MemoryCell(
             content=r["content"],
             user_id=r["user_id"],
             agent_id=r["agent_id"],
             vector_id=r["vector_id"],
             task_tags=tags,
+            entities=entities,
             is_risk=bool(r["is_risk"]),
             base_intensity=float(r["base_intensity"]),
             access_count=int(r["access_count"]),
@@ -325,7 +338,7 @@ class DBManager:
             self._conn.execute(
                 """UPDATE memory_cells
                    SET access_count = ?, last_accessed_at = ?, current_weight = ?,
-                       base_intensity = ?, is_risk = ?, task_tags = ?
+                       base_intensity = ?, is_risk = ?, task_tags = ?, entities = ?
                    WHERE id = ?""",
                 (
                     int(cell.access_count),
@@ -334,6 +347,7 @@ class DBManager:
                     float(cell.base_intensity),
                     int(cell.is_risk),
                     json.dumps(cell.task_tags, ensure_ascii=False),
+                    json.dumps(cell.entities, ensure_ascii=False),
                     cell.id,
                 ),
             )

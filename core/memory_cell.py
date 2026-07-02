@@ -43,6 +43,7 @@ class MemoryCell:
     agent_id: str = "default"
     vector_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     task_tags: dict[str, Any] = field(default_factory=dict)
+    entities: list[dict[str, Any]] = field(default_factory=list)  # 结构化实体列表
     is_risk: bool = False              # R_i ∈ {0, 1}
     base_intensity: float = 3.0        # I_i ∈ [1, 10]，LLM 评估的初始显性强度
     access_count: int = 1              # C_i，被成功检索唤醒的总次数（默认 1，对应 schema）

@@ -27,7 +27,7 @@ EMBED_DIM = 1536  # text-embedding-3-small 输出维度
 
 
 class OpenAILLMAuditor:
-    """用 OpenAI 大模型做记忆审计：风险识别 + 强度评分 + 标签提取。"""
+    """用 OpenAI 大模型做记忆审计：风险识别 + 强度评分 + 标签提取 + 实体提取。"""
 
     SYSTEM_PROMPT = """You are a memory auditor for an AI agent's long-term memory system.
 Analyze the user's message and return a JSON object with exactly these fields:
@@ -37,8 +37,13 @@ Analyze the user's message and return a JSON object with exactly these fields:
   "task_tags": {          // structured tags for retrieval filtering
     "type": str,          // "medical" | "secret" | "tech" | "casual" | "general"
     "project": str | null // if a project name is mentioned, extract it
-  }
+  },
+  "entities": [           // extracted named entities (empty list if none)
+    {"name": str, "type": str, "role": str}
+  ]
 }
+Types: "person", "project", "version", "tech", "org", "location"
+Roles: "subject", "owner", "tool", "reference"
 Return ONLY the JSON object, no other text."""
 
     def __init__(self) -> None:
@@ -73,10 +78,14 @@ Return ONLY the JSON object, no other text."""
             )
             raw = resp.choices[0].message.content or "{}"
             data = json.loads(raw)
+            raw_entities = data.get("entities", [])
+            if not isinstance(raw_entities, list):
+                raw_entities = []
             return {
                 "is_risk": bool(data.get("is_risk", False)),
                 "base_intensity": int(data.get("base_intensity", 4)),
                 "task_tags": data.get("task_tags", {"type": "general"}),
+                "entities": raw_entities,
             }
         except Exception as exc:
             # OpenAI 调用失败时降级到 Mock，不中断服务
@@ -153,6 +162,7 @@ class MockLLMAuditor:
             "is_risk": is_risk,
             "base_intensity": self._estimate_intensity(content, is_risk),
             "task_tags": self._extract_tags(content),
+            "entities": self._extract_entities(content),
         }
 
     @staticmethod
@@ -182,6 +192,37 @@ class MockLLMAuditor:
         else:
             tags["type"] = "general"
         return tags
+
+    @staticmethod
+    def _extract_entities(content: str) -> list[dict[str, str]]:
+        entities: list[dict[str, str]] = []
+        # 项目名（中文或英文，跟在"项目"后面）
+        for m in re.finditer(r"项目\s*([A-Za-z0-9_\-一-鿿]+)", content):
+            entities.append({"name": m.group(1), "type": "project", "role": "subject"})
+        # 人名（跟在"用户"或"开发者"或"负责人"后面）
+        for m in re.finditer(r"(?:用户|开发者|owner|负责人)[：:\s]*([A-Za-z0-9_\-一-鿿]{2,})", content):
+            entities.append({"name": m.group(1), "type": "person", "role": "owner"})
+        # 版本号
+        for m in re.finditer(r"v?(\d+\.\d+(?:\.\d+)?)", content):
+            entities.append({"name": m.group(0), "type": "version", "role": "reference"})
+        # 常见技术术语
+        TECH_TERMS = {"redis", "postgresql", "k8s", "prometheus", "docker",
+                      "kubernetes", "mysql", "nginx", "fastapi", "uvicorn"}
+        for term in TECH_TERMS:
+            if term in content.lower():
+                entities.append({"name": term, "type": "tech", "role": "tool"})
+        # agent 名
+        for m in re.finditer(r"agent\s*[：:\s]*([A-Za-z0-9_\-]+)", content, re.IGNORECASE):
+            entities.append({"name": m.group(1), "type": "agent", "role": "owner"})
+        # 去重：同 (name.lower(), type) 只保留第一条
+        seen: set[tuple[str, str]] = set()
+        deduped: list[dict[str, str]] = []
+        for e in entities:
+            key = (e["name"].lower(), e["type"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(e)
+        return deduped
 
 
 class MockEmbedder:

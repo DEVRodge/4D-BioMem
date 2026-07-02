@@ -3,7 +3,8 @@
 把 M1（剪枝引擎）+ M2（双轨存储）+ M3（双通路检索）缝合为 HTTP 服务：
 
   POST /v1/memory/add       异步录入：立即返回 queued，后台 LLM 审计 → 组装 MemoryCell → save_memory
-  POST /v1/memory/retrieve  双通路唤醒：A 硬过滤(近期+风险) + B 软匹配(向量) → 去重融合 → access_count += 1
+  POST /v1/memory/retrieve  双通路唤醒：A 硬过滤(近期+风险+标签+agent) + B 软匹配(向量+实体boost) → 去重融合 → access_count += 1
+  POST /v1/memory/synthesize 跨记忆合成：检索 Top-K → LLM 综合回答（Mock 模式返回拼接摘要）
   POST /v1/memory/prune     主动新陈代谢：扫描非风险记忆，物理抹除 W_i(t) < θ_prune 的死亡记忆
   GET  /v1/memory/list      列出某用户全部记忆（调试用）
   GET  /health              健康检查
@@ -78,7 +79,8 @@ class AppState:
         else:
             self.auditor = MockLLMAuditor()
             self.embedder = MockEmbedder()
-        self.write_queue: asyncio.Queue[tuple[str, str, str, dict | None]] | None = None
+        self.write_queue: asyncio.Queue[tuple[str, str, str, str, dict | None]] | None = None
+        # Queue: (request_id, user_id, agent_id, content, task_tags)
         self._worker_task: asyncio.Task | None = None
         self._stop = False
         # 剪枝计数（监控指标用）
@@ -108,18 +110,23 @@ class AppState:
         if self.db is None or self.db.count_sqlite() > 0:
             return
         now = datetime.now(tz=timezone.utc)
-        # (content, is_risk, intensity, access_count, days_ago_last_access, tags)
+        # (content, is_risk, intensity, access_count, days_ago_last_access, tags, entities)
         samples = [
-            ("我对青霉素过敏，开药务必避开青霉素类", True, 10.0, 1, 0, {"type": "medical"}),
-            ("服务器 root 密码是 Alpha-Bug-2024，务必保密", True, 10.0, 1, 5, {"type": "secret"}),
-            ("项目 Alpha 的 Bug 修复方案采用重试队列加幂等键", False, 7.0, 4, 1, {"type": "tech", "project": "Alpha"}),
-            ("项目 Alpha 的部署架构用 k8s 加双活", False, 7.0, 2, 15, {"type": "tech", "project": "Alpha"}),
-            ("项目 Alpha 的监控用 prometheus 加告警", False, 7.0, 6, 30, {"type": "tech", "project": "Alpha"}),
-            ("今天中午吃了酸菜鱼", False, 2.0, 1, 2, {"type": "casual"}),
-            ("昨晚看了一部电影，挺无聊的", False, 2.0, 1, 18, {"type": "casual"}),
-            ("周末想去爬山", False, 2.0, 1, 35, {"type": "casual"}),
+            ("我对青霉素过敏，开药务必避开青霉素类", True, 10.0, 1, 0, {"type": "medical"},
+             [{"name": "青霉素", "type": "tech", "role": "tool"}]),
+            ("服务器 root 密码是 Alpha-Bug-2024，务必保密", True, 10.0, 1, 5, {"type": "secret"},
+             [{"name": "Alpha-Bug-2024", "type": "version", "role": "reference"}]),
+            ("项目 Alpha 的 Bug 修复方案采用重试队列加幂等键", False, 7.0, 4, 1, {"type": "tech", "project": "Alpha"},
+             [{"name": "Alpha", "type": "project", "role": "subject"}]),
+            ("项目 Alpha 的部署架构用 k8s 加双活", False, 7.0, 2, 15, {"type": "tech", "project": "Alpha"},
+             [{"name": "Alpha", "type": "project", "role": "subject"}, {"name": "k8s", "type": "tech", "role": "tool"}]),
+            ("项目 Alpha 的监控用 prometheus 加告警", False, 7.0, 6, 30, {"type": "tech", "project": "Alpha"},
+             [{"name": "Alpha", "type": "project", "role": "subject"}, {"name": "prometheus", "type": "tech", "role": "tool"}]),
+            ("今天中午吃了酸菜鱼", False, 2.0, 1, 2, {"type": "casual"}, []),
+            ("昨晚看了一部电影，挺无聊的", False, 2.0, 1, 18, {"type": "casual"}, []),
+            ("周末想去爬山", False, 2.0, 1, 35, {"type": "casual"}, []),
         ]
-        for content, is_risk, intensity, access_count, days_ago, tags in samples:
+        for content, is_risk, intensity, access_count, days_ago, tags, entities in samples:
             last = now - timedelta(days=days_ago)
             vec = self.embedder._compute(content)
             cell = MemoryCell(
@@ -132,6 +139,7 @@ class AppState:
                 created_at=last,
                 last_accessed_at=last,
                 task_tags=tags,
+                entities=entities,
                 id=str(uuid.uuid4()),
             )
             cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
@@ -144,35 +152,37 @@ class AppState:
     async def shutdown(self) -> None:
         self._stop = True
         if self.write_queue is not None:
-            await self.write_queue.put(("__stop__", "", "", None))
+            await self.write_queue.put(("__stop__", "", "", "", None))
         if self._worker_task is not None:
             await self._worker_task
         if self.db is not None:
             self.db.close()
 
     async def _ingestion_worker(self) -> None:
-        """后台消费者：从队列取 (req_id, user_id, content, user_tags)，跑审计 → save_memory。"""
+        """后台消费者：从队列取 (req_id, user_id, agent_id, content, user_tags)，跑审计 → save_memory。"""
         assert self.db is not None and self.write_queue is not None
         while not self._stop:
-            req_id, user_id, content, user_tags = await self.write_queue.get()
+            req_id, user_id, agent_id, content, user_tags = await self.write_queue.get()
             if req_id == "__stop__":
                 break
             try:
                 audit = await self.auditor.audit(content)
                 # 合并标签：调用方显式传入的 task_tags 优先于自动提取
                 final_tags = {**audit["task_tags"], **(user_tags or {})}
+                entities = audit.get("entities", [])
                 vector = await self.embedder.embed(content)
                 now = datetime.now(tz=timezone.utc)
                 cell = MemoryCell(
                     content=content,
                     user_id=user_id,
-                    agent_id="biomem-api",
+                    agent_id=agent_id or "biomem-api",
                     is_risk=audit["is_risk"],
                     base_intensity=audit["base_intensity"],
                     access_count=1,
                     created_at=now,
                     last_accessed_at=now,
                     task_tags=final_tags,
+                    entities=entities,
                     id=str(uuid.uuid4()),
                 )
                 cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
@@ -191,6 +201,7 @@ class AppState:
 class AddRequest(BaseModel):
     user_id: str
     content: str
+    agent_id: str | None = None  # 来源 agent，不传则默认 biomem-api
     task_tags: dict | None = None
 
 
@@ -199,6 +210,17 @@ class RetrieveRequest(BaseModel):
     query: str
     top_k: int = Field(default=5, ge=1, le=50)
     query_tags: dict | None = None  # F 轴过滤：指定则通路A仅返回标签匹配的非风险记忆
+    query_entities: list[dict] | None = None  # 实体检索：通路B对命中实体做 score boost
+    agent_id: str | None = None  # 指定则只检索该 agent 的记忆（不传则不过滤）
+
+
+class SynthesizeRequest(BaseModel):
+    user_id: str
+    question: str
+    top_k: int = Field(default=5, ge=1, le=50)
+    query_tags: dict | None = None
+    query_entities: list[dict] | None = None
+    agent_id: str | None = None
 
 
 class PruneRequest(BaseModel):
@@ -238,7 +260,7 @@ def create_app(
         finally:
             await state.shutdown()
 
-    app = FastAPI(title="4D-BioMem API", version="1.1.0", lifespan=lifespan)
+    app = FastAPI(title="4D-BioMem API", version="1.2.0", lifespan=lifespan)
     app.state.state = state
     _register_routes(app, state)
     # 前端看板静态资源挂载在 /dashboard（访问 /dashboard 即打开 index.html）
@@ -272,7 +294,7 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
         if state.db is None or state.write_queue is None:
             raise HTTPException(503, "service not ready")
         request_id = str(uuid.uuid4())
-        await state.write_queue.put((request_id, req.user_id, req.content, req.task_tags))
+        await state.write_queue.put((request_id, req.user_id, req.agent_id or "biomem-api", req.content, req.task_tags))
         return {"status": "queued", "message": "Memory ingestion started.", "request_id": request_id}
 
     @app.get("/v1/memory/list", dependencies=[Depends(verify_api_key)])
@@ -288,10 +310,12 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
             items.append({
                 "id": c.id,
                 "content": c.content,
+                "agent_id": c.agent_id,
                 "is_risk": c.is_risk,
                 "base_intensity": c.base_intensity,
                 "access_count": c.access_count,
                 "task_tags": c.task_tags,
+                "entities": c.entities,
                 "last_accessed_at": c.last_accessed_at.isoformat(),
                 "current_weight": "INF" if w == RISK_LOCKED_WEIGHT else round(w, 4),
             })
@@ -302,99 +326,71 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
         """双通路唤醒：A 硬过滤 + B 软匹配 → 去重融合 → access_count += 1。"""
         if state.db is None:
             raise HTTPException(503, "service not ready")
-        db = state.db
-        now = datetime.now(tz=timezone.utc)
-        cells = db.load_cells_by_user(req.user_id)
-        if not cells:
-            return {"user_id": req.user_id, "query": req.query, "hits": [], "pathways": {"A": 0, "B": 0}}
-
-        query_vec = await state.embedder.embed(req.query)
-        qv = np.asarray(query_vec, dtype=np.float32)
-
-        # ---- 通路 A：潜意识反射（硬过滤）----------------------------------
-        # A1: 最近 5 条（按 last_accessed_at 降序）—— SPEC 指定的硬过滤窗口
-        recent = sorted(cells, key=lambda c: c.last_accessed_at, reverse=True)[:5]
-        # A2: 所有 is_risk=True 的生存本能记忆
-        risk_cells = [c for c in cells if c.is_risk]
-        pathway_a: dict[str, MemoryCell] = {}
-        for c in recent:
-            if req.query_tags and not c.is_risk:
-                if not _tags_overlap(c.task_tags, req.query_tags):
-                    continue
-            pathway_a[c.id] = c
-        for c in risk_cells:
-            pathway_a[c.id] = c
-        # 通路 A 权重（用于融合排序）
-        a_scores = {cid: c.compute_weight(now, DEFAULT_LAMBDA) for cid, c in pathway_a.items()}
-
-        # ---- 通路 B：显意识回忆（软匹配）----------------------------------
-        pathway_b: dict[str, float] = {}
-        for c in cells:
-            if c.is_risk:
-                continue  # 风险记忆已在 A 强制注入，软检索跳过
-            vec = db.get_vector(c.id)
-            if vec is None:
-                continue
-            sim = _cosine(qv, np.asarray(vec, dtype=np.float32))
-            if sim < 0.3:
-                continue
-            w = c.compute_weight(now, DEFAULT_LAMBDA)
-            score = sim * math.log(1.0 + w)
-            pathway_b[c.id] = score
-
-        # ---- 去重融合 -----------------------------------------------------
-        # 排序优先级：风险(置顶) > 通路B语义命中 > 通路A仅近期命中。
-        # 这样查询语义匹配的技术记忆排在仅"近期"的闲聊之上，避免闲聊因近期
-        # 权重尺度优势挤掉语义更相关的命中。
-        all_ids = set(pathway_a) | set(pathway_b)
-        fused: list[dict] = []
-        for cid in all_ids:
-            cell = next(c for c in cells if c.id == cid)
-            in_a = cid in pathway_a
-            in_b = cid in pathway_b
-            a_score = a_scores.get(cid, 0.0) if in_a else 0.0
-            b_score = pathway_b.get(cid, 0.0) if in_b else 0.0
-            if cell.is_risk:
-                sort_key = (True, True, float("inf"))
-                display = "INF"
-            elif in_b:
-                sort_key = (False, True, b_score)
-                display = round(b_score, 4)
-            else:
-                sort_key = (False, False, a_score)
-                display = round(a_score, 4)
-            pathways = []
-            if in_a:
-                pathways.append("reflex_risk" if cell.is_risk else "reflex_recent")
-            if in_b:
-                pathways.append("soft")
-            fused.append({
-                "id": cid,
-                "content": cell.content,
-                "is_risk": cell.is_risk,
-                "access_count": cell.access_count,
-                "score": display,
-                "_sort": sort_key,
-                "pathways": pathways,
-            })
-        fused.sort(key=lambda x: x["_sort"], reverse=True)
-        fused = fused[: req.top_k]
-        for x in fused:
-            x.pop("_sort", None)
-
-        # ---- 突触强化：access_count += 1 + 时间戳更新（持久化）-------------
-        for item in fused:
-            cell = next(c for c in cells if c.id == item["id"])
-            cell.access_count += 1
-            cell.last_accessed_at = now
-            cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
-            db.update_cell(cell)
-
+        hits, pathway_a, pathway_b = await _retrieve_hits(
+            state, req.user_id, req.query, req.top_k,
+            query_tags=req.query_tags, query_entities=req.query_entities,
+            agent_id=req.agent_id,
+        )
         return {
             "user_id": req.user_id,
             "query": req.query,
-            "hits": fused,
+            "hits": hits,
             "pathways": {"A": len(pathway_a), "B": len(pathway_b)},
+        }
+
+    @app.post("/v1/memory/synthesize", dependencies=[Depends(verify_api_key)])
+    async def synthesize_memory(req: SynthesizeRequest) -> dict:
+        """跨记忆合成：检索 Top-K → LLM 综合回答（Mock 模式返回拼接摘要）。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        hits, _, _ = await _retrieve_hits(
+            state, req.user_id, req.question, req.top_k,
+            query_tags=req.query_tags, query_entities=req.query_entities,
+            agent_id=req.agent_id,
+        )
+        contexts = [h["content"] for h in hits]
+
+        if settings.use_openai and settings.openai_api_key:
+            # OpenAI 路径：LLM 综合回答
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(
+                api_key=settings.openai_api_key,
+                base_url=settings.openai_base_url,
+            )
+            ctx_block = "\n---\n".join(f"[{i+1}] {c}" for i, c in enumerate(contexts))
+            prompt = (
+                f"Based on the following memory fragments, answer the user's question concisely.\n\n"
+                f"Question: {req.question}\n\n"
+                f"Memory fragments:\n{ctx_block}\n\n"
+                f"Answer:"
+            ) if contexts else f"No relevant memories found for: {req.question}"
+            try:
+                resp = await client.chat.completions.create(
+                    model=settings.openai_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=512,
+                )
+                answer = resp.choices[0].message.content or "No answer generated."
+                mode = "openai"
+            except Exception as exc:
+                answer = f"Synthesis failed: {exc}"
+                mode = "error"
+        else:
+            # Mock 路径：拼接摘要
+            if contexts:
+                answer = f"Found {len(contexts)} relevant memories:\n" + "\n".join(
+                    f"- {c}" for c in contexts
+                )
+            else:
+                answer = "No relevant memories found."
+            mode = "mock"
+
+        return {
+            "question": req.question,
+            "answer": answer,
+            "hits": hits,
+            "synthesis_mode": mode,
         }
 
     @app.post("/v1/memory/prune", dependencies=[Depends(verify_api_key)])
@@ -451,12 +447,14 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
             items.append({
                 "id": c.id,
                 "content": c.content,
+                "agent_id": c.agent_id,
                 "is_risk": c.is_risk,
                 "weight": "INF" if is_inf else round(w, 4),
                 "weight_sort": float("inf") if is_inf else w,
                 "access_count": c.access_count,
                 "base_intensity": c.base_intensity,
                 "task_tags": c.task_tags,
+                "entities": c.entities,
                 "seconds_since_last_access": max(0.0, (now - c.last_accessed_at).total_seconds()),
                 "last_accessed_at": c.last_accessed_at.isoformat(),
                 "_sort": (1 if c.is_risk else 0, float("inf") if is_inf else w),
@@ -496,6 +494,122 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
+
+
+async def _retrieve_hits(
+    state: AppState, user_id: str, query: str, top_k: int,
+    query_tags: dict | None = None,
+    query_entities: list[dict] | None = None,
+    agent_id: str | None = None,
+) -> tuple[list[dict], dict[str, MemoryCell], dict[str, float]]:
+    """共享检索逻辑：双通路唤醒 → 去重融合 → 突触强化 → 返回命中列表。
+
+    Returns
+    -------
+    (fused_hits, pathway_a, pathway_b)
+    """
+    db = state.db
+    now = datetime.now(tz=timezone.utc)
+    cells = db.load_cells_by_user(user_id)
+    if not cells:
+        return [], {}, {}
+
+    # agent_id 预过滤
+    if agent_id:
+        cells = [c for c in cells if c.agent_id == agent_id]
+
+    query_vec = await state.embedder.embed(query)
+    qv = np.asarray(query_vec, dtype=np.float32)
+
+    # ---- 通路 A：潜意识反射（硬过滤）----------------------------------
+    recent = sorted(cells, key=lambda c: c.last_accessed_at, reverse=True)[:5]
+    risk_cells = [c for c in cells if c.is_risk]
+    pathway_a: dict[str, MemoryCell] = {}
+    for c in recent:
+        if query_tags and not c.is_risk:
+            if not _tags_overlap(c.task_tags, query_tags):
+                continue
+        pathway_a[c.id] = c
+    for c in risk_cells:
+        pathway_a[c.id] = c
+    a_scores = {cid: c.compute_weight(now, DEFAULT_LAMBDA) for cid, c in pathway_a.items()}
+
+    # ---- 通路 B：显意识回忆（软匹配 + 实体 boost）-----------------------
+    pathway_b: dict[str, float] = {}
+    for c in cells:
+        if c.is_risk:
+            continue
+        vec = db.get_vector(c.id)
+        if vec is None:
+            continue
+        sim = _cosine(qv, np.asarray(vec, dtype=np.float32))
+        if sim < 0.3:
+            continue
+        w = c.compute_weight(now, DEFAULT_LAMBDA)
+        # 实体重叠 boost
+        entity_boost = 1.0
+        if query_entities and c.entities:
+            n_overlap = 0
+            for qe in query_entities:
+                for ce in c.entities:
+                    if (qe.get("name", "").lower() == ce.get("name", "").lower()
+                            and qe.get("type") == ce.get("type")):
+                        n_overlap += 1
+                        break
+            if n_overlap > 0:
+                entity_boost = min(1.25 ** n_overlap, 2.0)  # cap at 2x
+        score = sim * math.log(1.0 + w) * entity_boost
+        pathway_b[c.id] = score
+
+    # ---- 去重融合 -----------------------------------------------------
+    all_ids = set(pathway_a) | set(pathway_b)
+    fused: list[dict] = []
+    for cid in all_ids:
+        cell = next(c for c in cells if c.id == cid)
+        in_a = cid in pathway_a
+        in_b = cid in pathway_b
+        a_score = a_scores.get(cid, 0.0) if in_a else 0.0
+        b_score = pathway_b.get(cid, 0.0) if in_b else 0.0
+        if cell.is_risk:
+            sort_key = (True, True, float("inf"))
+            display = "INF"
+        elif in_b:
+            sort_key = (False, True, b_score)
+            display = round(b_score, 4)
+        else:
+            sort_key = (False, False, a_score)
+            display = round(a_score, 4)
+        pathways = []
+        if in_a:
+            pathways.append("reflex_risk" if cell.is_risk else "reflex_recent")
+        if in_b:
+            pathways.append("soft")
+        fused.append({
+            "id": cid,
+            "content": cell.content,
+            "agent_id": cell.agent_id,
+            "is_risk": cell.is_risk,
+            "access_count": cell.access_count,
+            "task_tags": cell.task_tags,
+            "entities": cell.entities,
+            "score": display,
+            "pathways": pathways,
+            "_sort": sort_key,
+        })
+    fused.sort(key=lambda x: x["_sort"], reverse=True)
+    fused = fused[:top_k]
+    for x in fused:
+        x.pop("_sort", None)
+
+    # ---- 突触强化：access_count += 1 + 时间戳更新（持久化）-------------
+    for item in fused:
+        cell = next(c for c in cells if c.id == item["id"])
+        cell.access_count += 1
+        cell.last_accessed_at = now
+        cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
+        db.update_cell(cell)
+
+    return fused, pathway_a, pathway_b
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
