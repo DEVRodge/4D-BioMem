@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](https://www.docker.com/)
-[![Version](https://img.shields.io/badge/release-v1.2.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.2.0)
+[![Version](https://img.shields.io/badge/release-v1.4.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.4.0)
 
 **4D-BioMem** 是一个受生物突触机制启发的 Agent 长效记忆系统。它模拟人脑的"新陈代谢"——记忆有强弱之分，高频使用的记忆被强化，低频噪声被物理抹除，安全底线永久锁定。
 
@@ -517,7 +517,7 @@ httpx>=0.28.0       # 仅客户端工具需要
 
 ## 📋 更新日志
 
-### v1.4.0 (未发布) — 检索融合排序 + Precision@K 提升
+### v1.4.0 (2026-07-10) — 检索融合排序 + Precision@K 提升
 
 **新增特性**
 - **风险敏感排序**：风险/医疗/机密类查询仍优先返回风险记忆；普通技术查询中，风险记忆作为常驻上下文保留，但不再挤占首位语义结果
@@ -538,7 +538,7 @@ httpx>=0.28.0       # 仅客户端工具需要
 - `test_retrieval.py`: 新增 S6-S11 回归场景，覆盖风险排序、实体 boost、force_soft、多通路融合与 lexical boost
 - `README.md`: 更新实验指标与更新日志
 
-### v1.3.0 (未发布) — API 检索路径统一核心检索器
+### v1.3.0 (2026-07-10) — API 检索路径统一核心检索器
 
 **新增特性**
 - **API / Core 检索统一**：`POST /v1/memory/retrieve` 不再维护独立检索实现，改为构建临时 `SynapticPruningEngine` 并复用 `DualPathwayRetriever`

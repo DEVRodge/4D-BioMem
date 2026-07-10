@@ -259,7 +259,7 @@ def create_app(
         finally:
             await state.shutdown()
 
-    app = FastAPI(title="4D-BioMem API", version="1.2.0", lifespan=lifespan)
+    app = FastAPI(title="4D-BioMem API", version="1.4.0", lifespan=lifespan)
     app.state.state = state
     _register_routes(app, state)
     # 前端看板静态资源挂载在 /dashboard（访问 /dashboard 即打开 index.html）
