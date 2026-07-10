@@ -59,12 +59,12 @@ $$W_i(t) = \begin{cases} \infty & \text{if } R_i = 1 \\ I_i \cdot \ln(1 + C_i) \
 | 指标 | A: Vanilla RAG | B: FIFO+摘要 | C: **4D-BioMem** |
 |------|:---:|:---:|:---:|
 | **高危召回率 Risk Recall** | 100.0% | 100.0% | **100.0%** |
-| **语义检索 Precision@K** | 100.0% | 100.0% | **40.0%** * |
+| **语义检索 Precision@K** | 100.0% | 100.0% | **100.0%** |
 | **上下文噪声比 Noise=闲聊** | 20.0% | 20.0% | **0.0%** |
 | **存储收敛**  | 50→50 (线性) | 50→50 (有界) | **50→23 (收敛)** |
 | **累计物理抹除** | 0 | 0 | **27 条闲聊** |
 
-> \* Precision@K 40% 是因为双通路检索的融合打分在多相似记忆时推挤了精确匹配项，是当前设计的一个可优化点。
+> v1.3/v1.4 检索融合优化后，风险常驻上下文不再挤占非风险查询排序，精确 soft 命中优先于泛化高权重硬命中，C 组 Precision@K 从 40% 提升到 100%。
 
 **存储收敛曲线**——C 组在 30 天模拟衰减后，全部 27 条闲聊被物理抹除，库从 50 急剧收敛到 23：
 
@@ -516,6 +516,39 @@ httpx>=0.28.0       # 仅客户端工具需要
 ---
 
 ## 📋 更新日志
+
+### v1.4.0 (未发布) — 检索融合排序 + Precision@K 提升
+
+**新增特性**
+- **风险敏感排序**：风险/医疗/机密类查询仍优先返回风险记忆；普通技术查询中，风险记忆作为常驻上下文保留，但不再挤占首位语义结果
+- **Soft 精排优先**：当硬反射与软检索同时命中同一记忆时，融合排序优先使用 soft 语义分数，避免泛化高权重硬命中压过精确语义命中
+- **强制 soft 检索开关**：`DualPathwayRetriever.retrieve(..., force_soft=True)` 支持在硬反射已足够时仍执行显意识检索，用于 API 和 benchmark 的自然语言精排场景
+- **轻量词面 boost**：soft 检索增加中文 bigram / 英文数字 token 的 lexical overlap boost，补偿 Mock Embedding 对中文短语细粒度匹配不稳定的问题
+- **实体 boost 下沉核心层**：`query_entities` 的实体重叠加权从 API 私有逻辑迁入 `core.retrieval`，API、实验组和未来调用方共享同一检索语义
+
+**实验结果**
+- C 组 `Precision@K` 从 **40.0%** 提升到 **100.0%**
+- C 组 `Risk Recall` 仍为 **100.0%**
+- C 组上下文噪声比仍为 **0.0%**
+- 存储收敛仍保持 **50 → 23**，累计物理抹除 27 条闲聊记忆
+
+**变更文件**
+- `core/retrieval.py`: 新增风险敏感排序、实体 boost、lexical boost、`force_soft`、`query_text` 参数与多通路 soft 分数融合
+- `experiment/group_c_biomem.py`: C 组 benchmark 启用 `force_soft=True` 和 `query_text`
+- `test_retrieval.py`: 新增 S6-S11 回归场景，覆盖风险排序、实体 boost、force_soft、多通路融合与 lexical boost
+- `README.md`: 更新实验指标与更新日志
+
+### v1.3.0 (未发布) — API 检索路径统一核心检索器
+
+**新增特性**
+- **API / Core 检索统一**：`POST /v1/memory/retrieve` 不再维护独立检索实现，改为构建临时 `SynapticPruningEngine` 并复用 `DualPathwayRetriever`
+- **查询自动审计**：API 检索时自动对 query 执行 Mock/OpenAI 审计，提取 `task_tags` 与 `entities`；调用方显式传入的 `query_tags` 仍优先生效
+- **非风险查询保留风险槽位**：API Top-K 对普通查询优先返回非风险语义结果，同时保留 1 条风险记忆作为安全上下文；风险敏感查询继续按核心排序优先风险记忆
+- **持久化强化闭环不变**：核心检索器完成突触强化后，API 统一将命中的 `access_count`、`last_accessed_at`、`current_weight` 回写 SQLite
+
+**变更文件**
+- `api/main.py`: `_retrieve_hits` 改为复用 `DualPathwayRetriever`，新增 `_select_api_hits` 返回策略，删除 API 私有 cosine / 融合排序逻辑
+- `test_api.py`: 新增端到端断言，验证技术查询首位为技术记忆且风险记忆仍随结果返回
 
 ### v1.2.0 (2026-07-02) — 实体提取 + 多 Agent 隔离 + 跨记忆合成
 

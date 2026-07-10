@@ -105,7 +105,12 @@ class GroupC(MemorySystem):
     def retrieve(self, query: str, top_k: int = 5) -> list[str]:
         _, _, tags = _audit(query)
         qv = np.asarray(_embed(query), dtype=np.float32)
-        result: RetrievalResult = self._retriever.retrieve(query_tags=tags, query_vector=qv)
+        result: RetrievalResult = self._retriever.retrieve(
+            query_tags=tags,
+            query_vector=qv,
+            force_soft=True,
+            query_text=query,
+        )
         return [h.cell.content for h in result.hits[:top_k]]
 
     def get_all_contents(self) -> list[str]:

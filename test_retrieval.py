@@ -200,6 +200,193 @@ def scenario_s5() -> bool:
     return _report(checks)
 
 
+def scenario_s6() -> bool:
+    """S6 风险常驻不挤占非风险查询排序：技术查询先给技术命中，风险仍随结果返回。"""
+    print("\n=== S6 风险常驻不挤占非风险查询排序 ===")
+    engine, cells, _, lookup = build_pool()
+    r = DualPathwayRetriever(engine, lookup, K_h=5, K_s=5, tau=1.0, sim_floor=0.3)
+    res = r.retrieve(query_tags={"project": "Alpha", "type": "tech"}, query_vector=Q_ALPHA)
+    ordered_ids = [h.cell.id for h in res.hits]
+    print(_hit_summary(res))
+    print(f"    ordered_ids={ordered_ids}")
+
+    checks = [
+        ("tech_alpha 是技术查询的首位结果", ordered_ids[0] == "tech_alpha"),
+        ("allergy 风险记忆仍在结果中常驻", "allergy" in ordered_ids),
+    ]
+    return _report(checks)
+
+
+def scenario_s7() -> bool:
+    """S7 风险类查询仍优先风险记忆：风险轨不能因排序优化被降级。"""
+    print("\n=== S7 风险类查询仍优先风险记忆 ===")
+    engine, cells, _, lookup = build_pool()
+    r = DualPathwayRetriever(engine, lookup, K_h=5, K_s=5, tau=1.0, sim_floor=0.3)
+    res = r.retrieve(query_tags={"type": "medical"}, query_vector=Q_MEDICAL)
+    ordered_ids = [h.cell.id for h in res.hits]
+    print(_hit_summary(res))
+    print(f"    ordered_ids={ordered_ids}")
+
+    checks = [
+        ("allergy 是风险查询的首位结果", ordered_ids[0] == "allergy"),
+        ("doc 仍可经软检索进入结果", "doc" in ordered_ids),
+    ]
+    return _report(checks)
+
+
+def scenario_s8() -> bool:
+    """S8 实体 boost：语义分数接近时，实体匹配项优先。"""
+    print("\n=== S8 实体 boost 优先实体匹配项 ===")
+    engine = SynapticPruningEngine(lambda_=0.05, theta_prune=0.5, start_time=T0)
+    vectors: dict[str, np.ndarray] = {}
+
+    def mk(cid, content, entities):
+        cell = MemoryCell(
+            content=content,
+            base_intensity=5.0,
+            is_risk=False,
+            access_count=1,
+            created_at=T0,
+            last_accessed_at=T0,
+            id=cid,
+            task_tags={"type": "tech"},
+            entities=entities,
+        )
+        engine.load_cell(cell)
+        vectors[cid] = Q_ALPHA
+
+    mk("plain", "项目 Alpha 的普通技术记录", [])
+    mk("entity", "项目 Alpha 的实体匹配技术记录",
+       [{"name": "Alpha", "type": "project", "role": "subject"}])
+
+    r = DualPathwayRetriever(
+        engine,
+        vector_lookup=lambda cid: vectors.get(cid),
+        K_h=0,
+        K_s=5,
+        tau=1.0,
+        sim_floor=0.3,
+    )
+    res = r.retrieve(
+        query_tags={},
+        query_vector=Q_ALPHA,
+        query_entities=[{"name": "Alpha", "type": "project"}],
+    )
+    ordered_ids = [h.cell.id for h in res.hits]
+    print(_hit_summary(res))
+    print(f"    ordered_ids={ordered_ids}")
+
+    checks = [
+        ("entity 因实体 boost 排在 plain 前", ordered_ids[0] == "entity"),
+    ]
+    return _report(checks)
+
+
+def scenario_s9() -> bool:
+    """S9 force_soft：硬反射够用时也可显式执行软检索补充精确语义命中。"""
+    print("\n=== S9 force_soft 强制软检索补充精确命中 ===")
+    engine, cells, _, lookup = build_pool()
+    r = DualPathwayRetriever(engine, lookup, K_h=5, K_s=5, tau=1.0, sim_floor=0.3)
+    res = r.retrieve(query_tags={"project": "Alpha"}, query_vector=Q_ALPHA, force_soft=True)
+    print(_hit_summary(res))
+
+    checks = [
+        ("soft_activated=True（force_soft 覆盖 τ）", res.soft_activated is True),
+        ("tech_alpha pathway 含 soft", "soft" in res.pathways_of("tech_alpha")),
+    ]
+    return _report(checks)
+
+
+def scenario_s10() -> bool:
+    """S10 多通路融合：force_soft 时用软语义分数压过泛化高权重硬命中。"""
+    print("\n=== S10 force_soft 使用软语义分数排序 ===")
+    engine = SynapticPruningEngine(lambda_=0.05, theta_prune=0.5, start_time=T0)
+    vectors: dict[str, np.ndarray] = {}
+
+    def mk(cid, content, access_count, vec):
+        cell = MemoryCell(
+            content=content,
+            base_intensity=5.0,
+            is_risk=False,
+            access_count=access_count,
+            created_at=T0,
+            last_accessed_at=T0,
+            id=cid,
+            task_tags={"project": "Alpha", "type": "tech"},
+        )
+        engine.load_cell(cell)
+        vectors[cid] = vec
+
+    mk("generic", "项目 Alpha 的泛化高频记录", 20, V_BETA)
+    mk("exact", "项目 Alpha 的精确语义记录", 1, Q_ALPHA)
+
+    r = DualPathwayRetriever(
+        engine,
+        vector_lookup=lambda cid: vectors.get(cid),
+        K_h=5,
+        K_s=5,
+        tau=1.0,
+        sim_floor=0.3,
+    )
+    res = r.retrieve(query_tags={"project": "Alpha"}, query_vector=Q_ALPHA, force_soft=True)
+    ordered_ids = [h.cell.id for h in res.hits]
+    print(_hit_summary(res))
+    print(f"    ordered_ids={ordered_ids}")
+
+    checks = [
+        ("exact 软语义命中排在 generic 高权重硬命中前", ordered_ids[0] == "exact"),
+        ("exact pathway 含 soft", "soft" in res.pathways_of("exact")),
+    ]
+    return _report(checks)
+
+
+def scenario_s11() -> bool:
+    """S11 lexical boost：低频精确短语可压过高频但不相关的同项目记忆。"""
+    print("\n=== S11 lexical boost 提升低频精确短语 ===")
+    engine = SynapticPruningEngine(lambda_=0.05, theta_prune=0.5, start_time=T0)
+    vectors: dict[str, np.ndarray] = {}
+
+    def mk(cid, content, access_count):
+        cell = MemoryCell(
+            content=content,
+            base_intensity=7.0,
+            is_risk=False,
+            access_count=access_count,
+            created_at=T0,
+            last_accessed_at=T0,
+            id=cid,
+            task_tags={"project": "Alpha", "type": "tech"},
+        )
+        engine.load_cell(cell)
+        vectors[cid] = Q_ALPHA
+
+    mk("generic", "项目 Alpha 的数据备份策略是每日全量", 20)
+    mk("exact", "项目 Alpha 的安全审计修复了 SQL 注入", 1)
+
+    r = DualPathwayRetriever(
+        engine,
+        vector_lookup=lambda cid: vectors.get(cid),
+        K_h=5,
+        K_s=5,
+        tau=1.0,
+        sim_floor=0.3,
+    )
+    res = r.retrieve(
+        query_tags={"project": "Alpha"},
+        query_vector=Q_ALPHA,
+        force_soft=True,
+        query_text="项目 Alpha 安全审计 SQL 注入怎么修的",
+    )
+    ordered_ids = [h.cell.id for h in res.hits]
+    print(_hit_summary(res))
+    print(f"    ordered_ids={ordered_ids}")
+
+    checks = [
+        ("exact 因 lexical boost 排在 generic 前", ordered_ids[0] == "exact"),
+    ]
+    return _report(checks)
+
+
 def _report(checks: list[tuple[str, bool]]) -> bool:
     ok_all = True
     for desc, ok in checks:
@@ -220,6 +407,12 @@ def main() -> bool:
         ("S3 τ边界翻转", scenario_s3),
         ("S4 突触强化闭环", scenario_s4),
         ("S5 时间窗硬过滤", scenario_s5),
+        ("S6 风险不挤占非风险排序", scenario_s6),
+        ("S7 风险查询优先风险记忆", scenario_s7),
+        ("S8 实体 boost 排序", scenario_s8),
+        ("S9 force_soft 覆盖 τ", scenario_s9),
+        ("S10 force_soft 使用软语义排序", scenario_s10),
+        ("S11 lexical boost 精确短语", scenario_s11),
     ]
     results = []
     for name, fn in scenarios:

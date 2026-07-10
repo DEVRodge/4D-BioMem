@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -30,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from config import settings
-from core.retrieval import _tags_overlap
+from core.retrieval import DualPathwayRetriever
 from core.llm_auditor import OpenAIEmbedder, OpenAILLMAuditor, MockEmbedder, MockLLMAuditor
 from core.memory_cell import RISK_LOCKED_WEIGHT, MemoryCell, SynapticPruningEngine
 from storage.db_manager import DBManager
@@ -517,107 +516,82 @@ async def _retrieve_hits(
     # agent_id 预过滤
     if agent_id:
         cells = [c for c in cells if c.agent_id == agent_id]
+    if not cells:
+        return [], {}, {}
 
+    query_audit = await state.auditor.audit(query)
+    effective_tags = {**query_audit.get("task_tags", {}), **(query_tags or {})}
+    effective_entities = query_entities or query_audit.get("entities", [])
     query_vec = await state.embedder.embed(query)
-    qv = np.asarray(query_vec, dtype=np.float32)
 
-    # ---- 通路 A：潜意识反射（硬过滤）----------------------------------
-    recent = sorted(cells, key=lambda c: c.last_accessed_at, reverse=True)[:5]
-    risk_cells = [c for c in cells if c.is_risk]
-    pathway_a: dict[str, MemoryCell] = {}
-    for c in recent:
-        if query_tags and not c.is_risk:
-            if not _tags_overlap(c.task_tags, query_tags):
-                continue
-        pathway_a[c.id] = c
-    for c in risk_cells:
-        pathway_a[c.id] = c
-    a_scores = {cid: c.compute_weight(now, DEFAULT_LAMBDA) for cid, c in pathway_a.items()}
+    # ---- 双通路检索：复用 core.retrieval，避免 API 与实验核心分叉 --------
+    engine = SynapticPruningEngine(lambda_=DEFAULT_LAMBDA, theta_prune=DEFAULT_THETA, start_time=now)
+    for cell in cells:
+        engine.load_cell(cell)
 
-    # ---- 通路 B：显意识回忆（软匹配 + 实体 boost）-----------------------
-    pathway_b: dict[str, float] = {}
-    for c in cells:
-        if c.is_risk:
-            continue
-        vec = db.get_vector(c.id)
-        if vec is None:
-            continue
-        sim = _cosine(qv, np.asarray(vec, dtype=np.float32))
-        if sim < 0.3:
-            continue
-        w = c.compute_weight(now, DEFAULT_LAMBDA)
-        # 实体重叠 boost
-        entity_boost = 1.0
-        if query_entities and c.entities:
-            n_overlap = 0
-            for qe in query_entities:
-                for ce in c.entities:
-                    if (qe.get("name", "").lower() == ce.get("name", "").lower()
-                            and qe.get("type") == ce.get("type")):
-                        n_overlap += 1
-                        break
-            if n_overlap > 0:
-                entity_boost = min(1.25 ** n_overlap, 2.0)  # cap at 2x
-        score = sim * math.log(1.0 + w) * entity_boost
-        pathway_b[c.id] = score
+    retriever = DualPathwayRetriever(
+        engine=engine,
+        vector_lookup=lambda cid: db.get_vector(cid),
+        K_h=5,
+        K_s=max(top_k, 5),
+        tau=DEFAULT_TAU,
+        sim_floor=0.3,
+    )
+    result = retriever.retrieve(
+        query_tags=effective_tags,
+        query_vector=np.asarray(query_vec, dtype=np.float32),
+        query_entities=effective_entities,
+        force_soft=True,
+        query_text=query,
+    )
 
-    # ---- 去重融合 -----------------------------------------------------
-    all_ids = set(pathway_a) | set(pathway_b)
+    # ---- API 返回策略：非风险查询保留一个风险常驻槽位，但不让风险抢首位 ----
+    selected_hits = _select_api_hits(result.hits, top_k, effective_tags)
     fused: list[dict] = []
-    for cid in all_ids:
-        cell = next(c for c in cells if c.id == cid)
-        in_a = cid in pathway_a
-        in_b = cid in pathway_b
-        a_score = a_scores.get(cid, 0.0) if in_a else 0.0
-        b_score = pathway_b.get(cid, 0.0) if in_b else 0.0
-        if cell.is_risk:
-            sort_key = (True, True, float("inf"))
-            display = "INF"
-        elif in_b:
-            sort_key = (False, True, b_score)
-            display = round(b_score, 4)
-        else:
-            sort_key = (False, False, a_score)
-            display = round(a_score, 4)
-        pathways = []
-        if in_a:
-            pathways.append("reflex_risk" if cell.is_risk else "reflex_recent")
-        if in_b:
-            pathways.append("soft")
+    for hit in selected_hits:
+        cell = hit.cell
         fused.append({
-            "id": cid,
+            "id": cell.id,
             "content": cell.content,
             "agent_id": cell.agent_id,
             "is_risk": cell.is_risk,
             "access_count": cell.access_count,
             "task_tags": cell.task_tags,
             "entities": cell.entities,
-            "score": display,
-            "pathways": pathways,
-            "_sort": sort_key,
+            "score": "INF" if cell.is_risk else round(hit.score, 4),
+            "pathways": hit.pathway.split("+"),
         })
-    fused.sort(key=lambda x: x["_sort"], reverse=True)
-    fused = fused[:top_k]
-    for x in fused:
-        x.pop("_sort", None)
 
-    # ---- 突触强化：access_count += 1 + 时间戳更新（持久化）-------------
-    for item in fused:
-        cell = next(c for c in cells if c.id == item["id"])
-        cell.access_count += 1
-        cell.last_accessed_at = now
-        cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
+    pathway_a: dict[str, MemoryCell] = {}
+    pathway_b: dict[str, float] = {}
+    for hit in result.hits:
+        if "reflex" in hit.pathway:
+            pathway_a[hit.cell.id] = hit.cell
+        if "soft" in hit.pathway:
+            pathway_b[hit.cell.id] = hit.score
+
+    # ---- 突触强化：core 已更新内存 cell；这里统一持久化回 SQLite ---------
+    for hit in result.hits:
+        cell = hit.cell
         db.update_cell(cell)
 
     return fused, pathway_a, pathway_b
 
 
-def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    na = float(np.linalg.norm(a))
-    nb = float(np.linalg.norm(b))
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
+def _select_api_hits(hits, top_k: int, query_tags: dict) -> list:
+    """API Top-K：风险常驻不抢非风险首位；风险查询仍按核心排序返回。"""
+    qtype = str(query_tags.get("type", "")).lower()
+    risk_sensitive = qtype in {"medical", "secret", "risk", "safety", "security"}
+    if risk_sensitive:
+        return hits[:top_k]
+
+    risk_hits = [h for h in hits if h.cell.is_risk]
+    regular_hits = [h for h in hits if not h.cell.is_risk]
+    if not risk_hits:
+        return regular_hits[:top_k]
+    if top_k <= 1:
+        return regular_hits[:1] or risk_hits[:1]
+    return regular_hits[: top_k - 1] + risk_hits[:1]
 
 
 # 默认应用实例（供 uvicorn 直接加载）

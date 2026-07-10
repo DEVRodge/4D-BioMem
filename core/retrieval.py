@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -80,10 +81,56 @@ def _tags_overlap(cell_tags: dict, query_tags: dict) -> bool:
     """F 轴硬过滤：query 的某个 (key, value) 在 cell 的 task_tags 中同时一致。"""
     if not cell_tags or not query_tags:
         return False
+    # 项目标签比通用 type 更具体；查询指定 project 时不能仅凭 type=tech 命中其它项目。
+    if "project" in query_tags:
+        return cell_tags.get("project") == query_tags["project"]
     for k, v in query_tags.items():
         if cell_tags.get(k) == v:
             return True
     return False
+
+
+def _query_is_risk_sensitive(query_tags: dict) -> bool:
+    """判断查询是否显式在寻找风险/医疗/机密类记忆。"""
+    qtype = str(query_tags.get("type", "")).lower()
+    return qtype in {"medical", "secret", "risk", "safety", "security"}
+
+
+def _entity_overlap_count(cell_entities: list[dict], query_entities: list[dict] | None) -> int:
+    """实体 boost：同 name（大小写不敏感）且 type 一致即视为重叠。"""
+    if not cell_entities or not query_entities:
+        return 0
+    count = 0
+    for qe in query_entities:
+        qname = str(qe.get("name", "")).lower()
+        qtype = qe.get("type")
+        for ce in cell_entities:
+            if str(ce.get("name", "")).lower() == qname and ce.get("type") == qtype:
+                count += 1
+                break
+    return count
+
+
+def _lexical_overlap_boost(query_text: str | None, content: str) -> float:
+    """轻量词面重叠加成，补偿 mock embedding 对中文短语的细粒度不足。"""
+    if not query_text:
+        return 1.0
+
+    def terms(text: str) -> set[str]:
+        lowered = text.lower()
+        alnum = set(re.findall(r"[a-z0-9][a-z0-9_\-]{1,}", lowered))
+        cjk = re.findall(r"[\u4e00-\u9fff]+", text)
+        grams: set[str] = set()
+        for chunk in cjk:
+            grams.update(chunk[i:i + 2] for i in range(max(0, len(chunk) - 1)))
+        return alnum | grams
+
+    q_terms = terms(query_text)
+    c_terms = terms(content)
+    if not q_terms or not c_terms:
+        return 1.0
+    overlap = len(q_terms & c_terms)
+    return min(1.0 + 0.25 * overlap, 3.0)
 
 
 class DualPathwayRetriever:
@@ -181,7 +228,12 @@ class DualPathwayRetriever:
 
     # ---- 显意识搜索链（软检索）---------------------------------------------
 
-    def soft_retrieve(self, query_vector) -> list[RetrievalHit]:
+    def soft_retrieve(
+        self,
+        query_vector,
+        query_entities: list[dict] | None = None,
+        query_text: str | None = None,
+    ) -> list[RetrievalHit]:
         """高维语义相似度软匹配 × 突触权重对数加成 → Top-K_s。
 
         风险记忆已在硬检索强制注入，此处跳过（其权重 ∞ 会扭曲 score 排序）。
@@ -190,7 +242,7 @@ class DualPathwayRetriever:
         lam = self.engine.lambda_
         qv = np.asarray(query_vector, dtype=np.float32)
 
-        scored: list[tuple[float, float, MemoryCell]] = []  # (score, sim, cell)
+        scored: list[tuple[float, float, float, float, MemoryCell]] = []
         for cell in self.engine.active_cells():
             if cell.is_risk:
                 continue
@@ -202,27 +254,46 @@ class DualPathwayRetriever:
                 continue
             w = cell.compute_weight(now, lam)
             # 相似度为主，突触权重为对数加成：log(1+w) ∈ [log(1.5), log(1+∞))
-            score = sim * math.log(1.0 + w)
-            scored.append((score, sim, cell))
+            entity_overlap = _entity_overlap_count(cell.entities, query_entities)
+            entity_boost = min(1.25 ** entity_overlap, 2.0) if entity_overlap else 1.0
+            lexical_boost = _lexical_overlap_boost(query_text, cell.content)
+            score = sim * math.log(1.0 + w) * entity_boost * lexical_boost
+            scored.append((score, sim, entity_boost, lexical_boost, cell))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         hits: list[RetrievalHit] = []
-        for score, sim, cell in scored[: self.K_s]:
+        for score, sim, entity_boost, lexical_boost, cell in scored[: self.K_s]:
             hits.append(RetrievalHit(
                 cell=cell, score=score, pathway=PATHWAY_SOFT,
-                detail={"sim": sim, "weight": cell.compute_weight(now, lam)},
+                detail={
+                    "sim": sim,
+                    "weight": cell.compute_weight(now, lam),
+                    "entity_boost": entity_boost,
+                    "lexical_boost": lexical_boost,
+                },
             ))
         return hits
 
     # ---- 双通路编排 --------------------------------------------------------
 
-    def retrieve(self, query_tags: dict, query_vector) -> RetrievalResult:
+    def retrieve(
+        self,
+        query_tags: dict,
+        query_vector,
+        query_entities: list[dict] | None = None,
+        force_soft: bool = False,
+        query_text: str | None = None,
+    ) -> RetrievalResult:
         """双通路检索主入口：硬检索 → τ 判定 → 可能升级软检索 → 合并去重 → 突触强化。"""
         hard_hits, hard_confidence = self.hard_retrieve(query_tags)
-        soft_activated = hard_confidence < self.tau
+        soft_activated = force_soft or hard_confidence < self.tau
         soft_hits: list[RetrievalHit] = []
         if soft_activated:
-            soft_hits = self.soft_retrieve(query_vector)
+            soft_hits = self.soft_retrieve(
+                query_vector,
+                query_entities=query_entities,
+                query_text=query_text,
+            )
 
         # 合并去重：同一 cell 可能同时被 reflex_task 与 soft 命中
         best_by_id: dict[str, RetrievalHit] = {}
@@ -230,7 +301,14 @@ class DualPathwayRetriever:
         for h in hard_hits + soft_hits:
             cid = h.cell.id
             pathways_by_id[cid].add(h.pathway)
-            if cid not in best_by_id or h.score > best_by_id[cid].score:
+            existing = best_by_id.get(cid)
+            incoming_is_soft = h.pathway == PATHWAY_SOFT
+            existing_is_soft = existing is not None and existing.pathway == PATHWAY_SOFT
+            if (
+                existing is None
+                or (incoming_is_soft and not h.cell.is_risk and not existing_is_soft)
+                or (incoming_is_soft == existing_is_soft and h.score > existing.score)
+            ):
                 best_by_id[cid] = h
 
         # 多通路命中的，合并 pathway 标签
@@ -242,8 +320,19 @@ class DualPathwayRetriever:
         for hit in best_by_id.values():
             self.engine.access(hit.cell.id)
 
+        risk_sensitive = _query_is_risk_sensitive(query_tags)
+        ordered_hits = sorted(
+            best_by_id.values(),
+            key=lambda h: (
+                h.cell.is_risk if risk_sensitive else not h.cell.is_risk,
+                PATHWAY_SOFT in h.pathway,
+                h.score,
+            ),
+            reverse=True,
+        )
+
         return RetrievalResult(
-            hits=list(best_by_id.values()),
+            hits=ordered_hits,
             hard_confidence=hard_confidence,
             soft_activated=soft_activated,
             hard_hits_count=len(hard_hits),

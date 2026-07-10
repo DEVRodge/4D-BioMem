@@ -147,6 +147,22 @@ def main() -> bool:
                         print(f"    hit: {h['content'][:24]:<26} pathways={h['pathways']} score={h['score']}")
             checks.append(("每次检索都强制返回风险记忆（allergy）", retrieve_hits_all_have_allergy))
 
+            # ---- Phase 4b: 标签化技术查询不应被风险常驻挤占首位 ------------
+            print("\n=== Phase 4b: 技术查询排序（风险常驻不挤占首位）===")
+            r = cli.post("/v1/memory/retrieve", json={
+                "user_id": BASE_USER,
+                "query": "项目 Alpha Bug 修复",
+                "top_k": 3,
+                "query_tags": {"project": "Alpha", "type": "tech"},
+            })
+            r.raise_for_status()
+            tagged_body = r.json()
+            tagged_hits = tagged_body["hits"]
+            for h in tagged_hits:
+                print(f"    hit: {h['content'][:24]:<26} tags={h['task_tags']} pathways={h['pathways']}")
+            checks.append(("标签化技术查询首位是 tech 记忆", tagged_hits[0]["task_tags"].get("type") == "tech"))
+            checks.append(("风险记忆仍随结果返回", any(h["is_risk"] for h in tagged_hits)))
+
             # ---- Phase 5: 校验 tech 强化、闲聊不变 -------------------------
             print("\n=== Phase 5: 校验突触强化（access_count + 权重上升）===")
             r = cli.get("/v1/memory/list", params={"user_id": BASE_USER})
