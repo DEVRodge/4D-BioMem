@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](https://www.docker.com/)
-[![Version](https://img.shields.io/badge/release-v1.4.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.4.0)
+[![Version](https://img.shields.io/badge/release-v1.6.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.6.0)
 
 **4D-BioMem** 是一个受生物突触机制启发的 Agent 长效记忆系统。它模拟人脑的"新陈代谢"——记忆有强弱之分，高频使用的记忆被强化，低频噪声被物理抹除，安全底线永久锁定。
 
@@ -359,7 +359,11 @@ curl -s "http://localhost:8000/v1/memory/list" -G -d user_id=hermes | python3 -m
 |------|------|------|
 | `GET` | `/health` | 健康检查（免鉴权） |
 | `POST` | `/v1/memory/add` | 异步录入记忆（立即返回 queued），支持 `task_tags` 字段 |
+| `POST` | `/v1/memory/ingest_event` | 写入每日片段事件；不会立即进入向量库 |
+| `GET` | `/v1/memory/events` | 列出每日片段事件，支持按用户、日期、归档状态过滤 |
+| `POST` | `/v1/memory/archive_day` | 将某天未归档片段聚合为长期记忆 |
 | `GET` | `/v1/memory/list` | 列出用户全部记忆 |
+| `GET` | `/v1/memory/tree` | 返回 Web 端记忆树；按用户 / Agent / 项目 / 虚拟 `.mem` 文件分组 |
 | `POST` | `/v1/memory/retrieve` | 双通路唤醒检索，支持 `query_tags` F 轴过滤、`query_entities` 实体 boost、`agent_id` 隔离 |
 | `POST` | `/v1/memory/synthesize` | 跨记忆合成问答：检索 Top-K → LLM 综合回答（Mock 模式返回拼接摘要） |
 | `POST` | `/v1/memory/prune` | 触发新陈代谢——抹除死亡记忆 |
@@ -516,6 +520,40 @@ httpx>=0.28.0       # 仅客户端工具需要
 ---
 
 ## 📋 更新日志
+
+### v1.6.0 (2026-07-23) — 每日片段摄取与归档
+
+**新增特性**
+- **每日片段表**：新增 `memory_events` SQLite 表，用于保存对话、任务、观察、决策等原始/半原始事件片段
+- **事件摄取接口**：新增 `POST /v1/memory/ingest_event`，Hermes 可在每轮或每个任务节点持续写入片段，而不是只在重要摘要时调用长期记忆写入
+- **事件查询接口**：新增 `GET /v1/memory/events`，支持按 `user_id`、`agent_id`、日期和归档状态查看片段
+- **每日归档接口**：新增 `POST /v1/memory/archive_day`，将某天未归档片段聚合为一条长期 `MemoryCell`，再进入原有召回、强化、剪枝生命周期
+- **Dashboard 每日片段视图**：记忆树页新增每日片段面板，展示事件内容、标签、归档状态和归档后的长期记忆 id
+
+**设计约束**
+- v1.6 不引入自动定时任务；归档需要由 Hermes 或用户显式触发，避免对本机 Docker 运行中的记忆库产生意外写入
+- 新增表为加法迁移，不改变既有 `memory_cells` 结构和向量库格式
+
+**变更文件**
+- `storage/db_manager.py`: 新增 `memory_events` 表、事件保存/查询/归档标记方法
+- `api/main.py`: 新增 `EventIngestRequest`、`ArchiveDayRequest`、`/v1/memory/ingest_event`、`/v1/memory/events`、`/v1/memory/archive_day`，API 版本升至 `1.6.0`
+- `api/static/index.html`: 记忆树页新增每日片段面板
+- `test_memory_events.py`: 新增事件摄取、查询和归档回归测试
+- `README.md`: 更新版本徽章、API 列表和更新日志
+
+### v1.5.0 (2026-07-23) — Web 端记忆树查看
+
+**新增特性**
+- **记忆树接口**：新增 `GET /v1/memory/tree` 只读端点，将 SQLite 记忆行整理为 `user_id / agent_id / project / 虚拟文件` 层级
+- **虚拟 `.mem` 文件**：Web 端以 `.mem` 展示分组，明确表示“虚拟记忆文件”，不会生成真实 Markdown 文件，也不改变 SQLite + 向量库双轨存储格式
+- **Dashboard 树状查看**：`/dashboard/` 新增“记忆树”视图，点击虚拟文件后可查看其中的原始记忆内容、标签、实体、权重、唤醒次数和时间戳
+- **内容前缀归档**：支持 `[项目进展]`、`[用户偏好]`、`[行为规则]`、`[版本记录]` 等前缀优先归入对应虚拟文件；无前缀时按 `task_tags.type` 归类
+
+**变更文件**
+- `api/main.py`: 新增 `_build_memory_tree` 系列辅助函数与 `/v1/memory/tree` 端点，API 版本升至 `1.5.0`
+- `api/static/index.html`: 新增“记忆能量 / 记忆树”视图切换、树浏览器和虚拟文件详情面板
+- `test_memory_tree.py`: 新增记忆树分组回归测试
+- `README.md`: 更新版本徽章、API 列表和更新日志
 
 ### v1.4.0 (2026-07-10) — 检索融合排序 + Precision@K 提升
 

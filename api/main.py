@@ -7,6 +7,7 @@
   POST /v1/memory/synthesize 跨记忆合成：检索 Top-K → LLM 综合回答（Mock 模式返回拼接摘要）
   POST /v1/memory/prune     主动新陈代谢：扫描非风险记忆，物理抹除 W_i(t) < θ_prune 的死亡记忆
   GET  /v1/memory/list      列出某用户全部记忆（调试用）
+  GET  /v1/memory/tree      将记忆行整理为 Web 端虚拟文件树（只读）
   GET  /health              健康检查
 
 LLM/Embedding 默认用 Mock（无需 API Key）；设置 LLM_BACKEND=openai + OPENAI_API_KEY 启用 OpenAI。
@@ -40,6 +41,163 @@ from storage.db_manager import DBManager
 DEFAULT_LAMBDA = settings.lambda_
 DEFAULT_THETA = settings.theta_prune
 DEFAULT_TAU = settings.tau
+
+
+# ---------------------------------------------------------------------------
+# Web 记忆树（虚拟视图，不改变存储格式）
+# ---------------------------------------------------------------------------
+
+_TYPE_FILE_NAMES = {
+    "tech": "技术记忆.mem",
+    "technical": "技术记忆.mem",
+    "preference": "用户偏好.mem",
+    "medical": "风险与医疗.mem",
+    "risk": "风险与医疗.mem",
+    "casual": "闲聊片段.mem",
+    "general": "通用记忆.mem",
+}
+
+_PREFIX_FILE_NAMES = {
+    "[项目进展]": "项目进展.mem",
+    "[用户偏好]": "用户偏好.mem",
+    "[行为规则]": "行为规则.mem",
+    "[对话约定]": "对话约定.mem",
+    "[架构决策]": "架构决策.mem",
+    "[Bug修复]": "Bug修复.mem",
+    "[迭代计划]": "迭代计划.mem",
+    "[版本记录]": "版本记录.mem",
+}
+
+
+def _folder(name: str, virtual_path: str) -> dict[str, Any]:
+    return {
+        "kind": "folder",
+        "name": name,
+        "virtual_path": virtual_path,
+        "children": [],
+        "_children_by_name": {},
+    }
+
+
+def _file(name: str, virtual_path: str) -> dict[str, Any]:
+    return {
+        "kind": "file",
+        "name": name,
+        "virtual_path": virtual_path,
+        "format": "virtual-memory-group",
+        "memory_count": 0,
+        "items": [],
+    }
+
+
+def _child_folder(parent: dict[str, Any], name: str) -> dict[str, Any]:
+    children_by_name = parent["_children_by_name"]
+    if name not in children_by_name:
+        base = "" if parent["virtual_path"] == "/" else parent["virtual_path"].rstrip("/")
+        child_path = f"{base}/{name}" if base else name
+        child = _folder(name, child_path)
+        children_by_name[name] = child
+        parent["children"].append(child)
+    return children_by_name[name]
+
+
+def _project_name(cell: MemoryCell) -> str:
+    project = cell.task_tags.get("project")
+    if isinstance(project, str) and project.strip():
+        return project.strip()
+    return "通用记忆"
+
+
+def _virtual_file_name(cell: MemoryCell) -> str:
+    content = cell.content.strip()
+    for prefix, file_name in _PREFIX_FILE_NAMES.items():
+        if content.startswith(prefix):
+            return file_name
+    tag_type = str(cell.task_tags.get("type", "general")).strip().lower()
+    if cell.is_risk:
+        return "风险与医疗.mem"
+    return _TYPE_FILE_NAMES.get(tag_type, "通用记忆.mem")
+
+
+def _memory_tree_item(cell: MemoryCell, now: datetime) -> dict[str, Any]:
+    weight = cell.compute_weight(now, DEFAULT_LAMBDA)
+    return {
+        "id": cell.id,
+        "content": cell.content,
+        "user_id": cell.user_id,
+        "agent_id": cell.agent_id,
+        "is_risk": cell.is_risk,
+        "weight": "INF" if weight == RISK_LOCKED_WEIGHT else round(weight, 4),
+        "weight_sort": float("inf") if weight == RISK_LOCKED_WEIGHT else weight,
+        "access_count": cell.access_count,
+        "base_intensity": cell.base_intensity,
+        "task_tags": cell.task_tags,
+        "entities": cell.entities,
+        "created_at": cell.created_at.isoformat(),
+        "last_accessed_at": cell.last_accessed_at.isoformat(),
+    }
+
+
+def _strip_internal_tree_fields(node: dict[str, Any]) -> dict[str, Any]:
+    node.pop("_children_by_name", None)
+    if node["kind"] == "folder":
+        node["children"].sort(key=lambda child: (child["kind"] != "folder", child["name"]))
+        for child in node["children"]:
+            _strip_internal_tree_fields(child)
+    return node
+
+
+def _build_memory_tree(cells: list[MemoryCell], now: datetime) -> dict[str, Any]:
+    """把 SQLite 记忆行整理成只读虚拟树。
+
+    注意：`.mem` 只是 Web 端虚拟分组名，不是磁盘文件格式。
+    """
+    root = _folder("memories", "/")
+    flat_items = []
+    ordered_cells = sorted(
+        cells,
+        key=lambda c: (
+            c.user_id,
+            c.agent_id,
+            _project_name(c),
+            _virtual_file_name(c),
+            c.last_accessed_at.isoformat(),
+            c.id,
+        ),
+    )
+
+    for cell in ordered_cells:
+        item = _memory_tree_item(cell, now)
+        flat_items.append(item)
+        user_node = _child_folder(root, cell.user_id)
+        agent_node = _child_folder(user_node, cell.agent_id)
+        project_node = _child_folder(agent_node, _project_name(cell))
+        file_name = _virtual_file_name(cell)
+        file_path = f"{project_node['virtual_path'].rstrip('/')}/{file_name}"
+        file_node = project_node["_children_by_name"].get(file_name)
+        if file_node is None:
+            file_node = _file(file_name, file_path)
+            project_node["_children_by_name"][file_name] = file_node
+            project_node["children"].append(file_node)
+        file_node["items"].append(item)
+        file_node["memory_count"] = len(file_node["items"])
+
+    return {
+        "format": "virtual-memory-tree",
+        "storage": "sqlite_rows_plus_vector_store",
+        "count": len(flat_items),
+        "items": flat_items,
+        "tree": _strip_internal_tree_fields(root),
+    }
+
+
+def _archive_content(user_id: str, agent_id: str, date: str, events: list[dict[str, Any]]) -> str:
+    """把一天的事件片段压成确定性的长期记忆文本。"""
+    lines = [f"[每日片段] {date} {user_id}/{agent_id} 共 {len(events)} 条："]
+    for idx, event in enumerate(events, start=1):
+        content = " ".join(event["content"].split())
+        lines.append(f"- {idx}. [{event['event_type']}] {content}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +362,22 @@ class AddRequest(BaseModel):
     task_tags: dict | None = None
 
 
+class EventIngestRequest(BaseModel):
+    user_id: str
+    content: str
+    agent_id: str | None = None
+    event_type: str = "generic"
+    task_tags: dict | None = None
+    occurred_at: datetime | None = None
+
+
+class ArchiveDayRequest(BaseModel):
+    user_id: str
+    date: str
+    agent_id: str | None = None
+    task_tags: dict | None = None
+
+
 class RetrieveRequest(BaseModel):
     user_id: str
     query: str
@@ -259,7 +433,7 @@ def create_app(
         finally:
             await state.shutdown()
 
-    app = FastAPI(title="4D-BioMem API", version="1.4.0", lifespan=lifespan)
+    app = FastAPI(title="4D-BioMem API", version="1.6.0", lifespan=lifespan)
     app.state.state = state
     _register_routes(app, state)
     # 前端看板静态资源挂载在 /dashboard（访问 /dashboard 即打开 index.html）
@@ -296,6 +470,100 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
         await state.write_queue.put((request_id, req.user_id, req.agent_id or "biomem-api", req.content, req.task_tags))
         return {"status": "queued", "message": "Memory ingestion started.", "request_id": request_id}
 
+    @app.post("/v1/memory/ingest_event", dependencies=[Depends(verify_api_key)])
+    async def ingest_event(req: EventIngestRequest) -> dict:
+        """写入一条每日片段事件；不会立即进入向量库或长期记忆。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        event = state.db.save_event(
+            user_id=req.user_id,
+            agent_id=req.agent_id or "biomem-api",
+            content=req.content,
+            event_type=req.event_type,
+            task_tags=req.task_tags,
+            occurred_at=req.occurred_at,
+        )
+        return {"status": "stored", "event": event}
+
+    @app.get("/v1/memory/events", dependencies=[Depends(verify_api_key)])
+    async def list_events(
+        user_id: str | None = None,
+        date: str | None = None,
+        archived: bool | None = None,
+        agent_id: str | None = None,
+        limit: int = 500,
+    ) -> dict:
+        """列出每日片段事件。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        items = state.db.list_events(
+            user_id=user_id,
+            date=date,
+            archived=archived,
+            agent_id=agent_id,
+            limit=max(1, min(limit, 2000)),
+        )
+        return {"count": len(items), "items": items}
+
+    @app.post("/v1/memory/archive_day", dependencies=[Depends(verify_api_key)])
+    async def archive_day(req: ArchiveDayRequest) -> dict:
+        """把某天未归档片段聚合为一条长期记忆。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        agent_id = req.agent_id or "biomem-api"
+        events = state.db.list_events(
+            user_id=req.user_id,
+            date=req.date,
+            archived=False,
+            agent_id=agent_id,
+            limit=2000,
+        )
+        if not events:
+            return {
+                "status": "empty",
+                "user_id": req.user_id,
+                "agent_id": agent_id,
+                "date": req.date,
+                "event_count": 0,
+            }
+
+        content = _archive_content(req.user_id, agent_id, req.date, events)
+        audit = await state.auditor.audit(content)
+        final_tags = {
+            **audit["task_tags"],
+            **(req.task_tags or {}),
+            "type": "daily_archive",
+            "date": req.date,
+            "source": "memory_events",
+        }
+        entities = audit.get("entities", [])
+        vector = await state.embedder.embed(content)
+        now = datetime.now(tz=timezone.utc)
+        cell = MemoryCell(
+            content=content,
+            user_id=req.user_id,
+            agent_id=agent_id,
+            is_risk=bool(audit["is_risk"]),
+            base_intensity=float(audit["base_intensity"]),
+            created_at=now,
+            last_accessed_at=now,
+            task_tags=final_tags,
+            entities=entities,
+            id=str(uuid.uuid4()),
+        )
+        cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
+        state.db.save_memory(cell, vector)
+        state.db.mark_events_archived([event["id"] for event in events], cell.id)
+        return {
+            "status": "archived",
+            "user_id": req.user_id,
+            "agent_id": agent_id,
+            "date": req.date,
+            "event_count": len(events),
+            "archive_cell_id": cell.id,
+            "content": content,
+        }
+
     @app.get("/v1/memory/list", dependencies=[Depends(verify_api_key)])
     async def list_memory(user_id: str) -> dict:
         """列出某用户全部记忆（调试用）。"""
@@ -319,6 +587,17 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
                 "current_weight": "INF" if w == RISK_LOCKED_WEIGHT else round(w, 4),
             })
         return {"user_id": user_id, "count": len(items), "items": items}
+
+    @app.get("/v1/memory/tree", dependencies=[Depends(verify_api_key)])
+    async def memory_tree(user_id: str | None = None) -> dict:
+        """返回 Web 端记忆树。
+
+        底层仍是 SQLite 行 + 向量库；`.mem` 是只读虚拟分组，不是实际文件。
+        """
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        cells = state.db.load_cells_by_user(user_id) if user_id else state.db.load_all_active_cells()
+        return _build_memory_tree(cells, datetime.now(tz=timezone.utc))
 
     @app.post("/v1/memory/retrieve", dependencies=[Depends(verify_api_key)])
     async def retrieve_memory(req: RetrieveRequest) -> dict:

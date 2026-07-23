@@ -17,7 +17,8 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Iterable, Protocol
 
 from core.memory_cell import RISK_LOCKED_WEIGHT, MemoryCell
@@ -175,6 +176,19 @@ CREATE TABLE IF NOT EXISTS memory_cells (
     last_accessed_at TEXT NOT NULL,        -- ISO 8601
     current_weight   REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS memory_events (
+    id               TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL,
+    agent_id         TEXT NOT NULL,
+    content          TEXT NOT NULL,
+    event_type       TEXT NOT NULL,
+    task_tags        TEXT,
+    created_at       TEXT NOT NULL,
+    occurred_at      TEXT NOT NULL,
+    archived         INTEGER NOT NULL DEFAULT 0,
+    archive_cell_id  TEXT
+);
 """
 
 _INSERT_SQL = """
@@ -183,6 +197,13 @@ INSERT OR REPLACE INTO memory_cells
      is_risk, base_intensity, access_count,
      created_at, last_accessed_at, current_weight)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+_INSERT_EVENT_SQL = """
+INSERT INTO memory_events
+    (id, user_id, agent_id, content, event_type, task_tags,
+     created_at, occurred_at, archived, archive_cell_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -231,6 +252,23 @@ class DBManager:
         if "entities" not in columns:
             self._conn.execute("ALTER TABLE memory_cells ADD COLUMN entities TEXT DEFAULT '[]'")
             self._conn.commit()
+
+        # v1.6: 每日片段摄取表。对已存在库做幂等创建。
+        self._conn.executescript("""
+        CREATE TABLE IF NOT EXISTS memory_events (
+            id               TEXT PRIMARY KEY,
+            user_id          TEXT NOT NULL,
+            agent_id         TEXT NOT NULL,
+            content          TEXT NOT NULL,
+            event_type       TEXT NOT NULL,
+            task_tags        TEXT,
+            created_at       TEXT NOT NULL,
+            occurred_at      TEXT NOT NULL,
+            archived         INTEGER NOT NULL DEFAULT 0,
+            archive_cell_id  TEXT
+        );
+        """)
+        self._conn.commit()
 
     # ---- Dual-Write --------------------------------------------------------
 
@@ -350,6 +388,112 @@ class DBManager:
                     json.dumps(cell.entities, ensure_ascii=False),
                     cell.id,
                 ),
+            )
+            self._conn.commit()
+
+    # ---- Daily Event Fragments -------------------------------------------
+
+    def save_event(
+        self,
+        *,
+        user_id: str,
+        agent_id: str = "biomem-api",
+        content: str,
+        event_type: str = "generic",
+        task_tags: dict | None = None,
+        occurred_at: datetime | None = None,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        """保存一条每日片段事件。
+
+        事件只进入 SQLite，不写向量库；归档后才生成长期 MemoryCell。
+        """
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        now = datetime.now(tz=timezone.utc)
+        occurred = occurred_at or now
+        row = (
+            event_id or str(uuid.uuid4()),
+            user_id,
+            agent_id,
+            content,
+            event_type or "generic",
+            json.dumps(task_tags or {}, ensure_ascii=False),
+            now.isoformat(),
+            occurred.isoformat(),
+            0,
+            None,
+        )
+        with self._lock:
+            self._conn.execute(_INSERT_EVENT_SQL, row)
+            self._conn.commit()
+        return self._event_row_to_dict(self._get_event_row(row[0]))
+
+    def _get_event_row(self, event_id: str) -> sqlite3.Row:
+        row = self._conn.execute("SELECT * FROM memory_events WHERE id = ?", (event_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"memory event not found: {event_id}")
+        return row
+
+    def _event_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "user_id": row["user_id"],
+            "agent_id": row["agent_id"],
+            "content": row["content"],
+            "event_type": row["event_type"],
+            "task_tags": json.loads(row["task_tags"]) if row["task_tags"] else {},
+            "created_at": row["created_at"],
+            "occurred_at": row["occurred_at"],
+            "archived": bool(row["archived"]),
+            "archive_cell_id": row["archive_cell_id"],
+        }
+
+    def list_events(
+        self,
+        *,
+        user_id: str | None = None,
+        date: str | None = None,
+        archived: bool | None = None,
+        agent_id: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """列出每日片段事件，按发生时间升序。"""
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        clauses = []
+        params: list[Any] = []
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if agent_id:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if date:
+            clauses.append("substr(occurred_at, 1, 10) = ?")
+            params.append(date)
+        if archived is not None:
+            clauses.append("archived = ?")
+            params.append(1 if archived else 0)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM memory_events {where} ORDER BY occurred_at ASC, created_at ASC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [self._event_row_to_dict(row) for row in rows]
+
+    def mark_events_archived(self, event_ids: list[str], archive_cell_id: str) -> None:
+        """把片段标记为已归档，并关联生成的长期记忆 cell。"""
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        if not event_ids:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE memory_events SET archived = 1, archive_cell_id = ? WHERE id = ?",
+                [(archive_cell_id, event_id) for event_id in event_ids],
             )
             self._conn.commit()
 
