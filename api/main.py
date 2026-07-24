@@ -3,11 +3,17 @@
 把 M1（剪枝引擎）+ M2（双轨存储）+ M3（双通路检索）缝合为 HTTP 服务：
 
   POST /v1/memory/add       异步录入：立即返回 queued，后台 LLM 审计 → 组装 MemoryCell → save_memory
+  POST /v1/memory/ingest_event 写入每日片段事件；不会立即进入向量库
+  GET  /v1/memory/events    列出每日片段事件
+  POST /v1/memory/archive_day 将每日片段归档为长期记忆
   POST /v1/memory/retrieve  双通路唤醒：A 硬过滤(近期+风险+标签+agent) + B 软匹配(向量+实体boost) → 去重融合 → access_count += 1
   POST /v1/memory/synthesize 跨记忆合成：检索 Top-K → LLM 综合回答（Mock 模式返回拼接摘要）
   POST /v1/memory/prune     主动新陈代谢：扫描非风险记忆，物理抹除 W_i(t) < θ_prune 的死亡记忆
   GET  /v1/memory/list      列出某用户全部记忆（调试用）
   GET  /v1/memory/tree      将记忆行整理为 Web 端虚拟文件树（只读）
+  POST /v1/wiki/build       生成 OpenWiki 风格 Memory Wiki（派生 Markdown）
+  GET  /v1/wiki/pages       列出最近一次生成的 Wiki 页面
+  GET  /v1/wiki/page        读取单个 Wiki 页面内容
   GET  /health              健康检查
 
 LLM/Embedding 默认用 Mock（无需 API Key）；设置 LLM_BACKEND=openai + OPENAI_API_KEY 启用 OpenAI。
@@ -22,6 +28,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -33,6 +40,7 @@ from config import settings
 from core.retrieval import DualPathwayRetriever
 from core.llm_auditor import OpenAIEmbedder, OpenAILLMAuditor, MockEmbedder, MockLLMAuditor
 from core.memory_cell import RISK_LOCKED_WEIGHT, MemoryCell, SynapticPruningEngine
+from core.memory_wiki import build_memory_wiki
 from storage.db_manager import DBManager
 
 # ---------------------------------------------------------------------------
@@ -222,10 +230,11 @@ async def verify_api_key(x_api_key: str | None = Header(None)):
 class AppState:
     """单例式应用状态：DB 管理器 + 审计器 + 嵌入器 + 写入队列。"""
 
-    def __init__(self, db_path: str, vector_path: str, prefer_chroma: bool = False,
+    def __init__(self, db_path: str, vector_path: str, wiki_path: str, prefer_chroma: bool = False,
                  seed: bool = True) -> None:
         self.db_path = db_path
         self.vector_path = vector_path
+        self.wiki_path = wiki_path
         self.prefer_chroma = prefer_chroma
         self.seed = seed
         self.db: DBManager | None = None
@@ -378,6 +387,11 @@ class ArchiveDayRequest(BaseModel):
     task_tags: dict | None = None
 
 
+class WikiBuildRequest(BaseModel):
+    user_id: str | None = None
+    agent_id: str | None = None
+
+
 class RetrieveRequest(BaseModel):
     user_id: str
     query: str
@@ -411,18 +425,20 @@ class PruneRequest(BaseModel):
 def create_app(
     db_path: str | None = None,
     vector_path: str | None = None,
+    wiki_path: str | None = None,
     prefer_chroma: bool | None = None,
     seed: bool | None = None,
 ) -> FastAPI:
     # 优先用显式参数，否则从 config 环境变量读取
     db_path = db_path or settings.db_path
     vector_path = vector_path or settings.vector_path
+    wiki_path = wiki_path or settings.wiki_path
     if prefer_chroma is None:
         prefer_chroma = settings.prefer_chroma
     if seed is None:
         seed = settings.seed
 
-    state = AppState(db_path, vector_path, prefer_chroma, seed=seed)
+    state = AppState(db_path, vector_path, wiki_path, prefer_chroma, seed=seed)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -433,7 +449,7 @@ def create_app(
         finally:
             await state.shutdown()
 
-    app = FastAPI(title="4D-BioMem API", version="1.6.0", lifespan=lifespan)
+    app = FastAPI(title="4D-BioMem API", version="1.7.0", lifespan=lifespan)
     app.state.state = state
     _register_routes(app, state)
     # 前端看板静态资源挂载在 /dashboard（访问 /dashboard 即打开 index.html）
@@ -598,6 +614,56 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
             raise HTTPException(503, "service not ready")
         cells = state.db.load_cells_by_user(user_id) if user_id else state.db.load_all_active_cells()
         return _build_memory_tree(cells, datetime.now(tz=timezone.utc))
+
+    @app.post("/v1/wiki/build", dependencies=[Depends(verify_api_key)])
+    async def wiki_build(req: WikiBuildRequest) -> dict:
+        """生成 OpenWiki 风格的本地 Markdown Memory Wiki。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        cells = state.db.load_cells_by_user(req.user_id) if req.user_id else state.db.load_all_active_cells()
+        if req.agent_id:
+            cells = [cell for cell in cells if cell.agent_id == req.agent_id]
+        events = state.db.list_events(user_id=req.user_id, agent_id=req.agent_id, limit=5000)
+        manifest = build_memory_wiki(
+            cells=cells,
+            events=events,
+            output_dir=state.wiki_path,
+            now=datetime.now(tz=timezone.utc),
+        )
+        return {"status": "built", "wiki_path": state.wiki_path, **manifest}
+
+    @app.get("/v1/wiki/pages", dependencies=[Depends(verify_api_key)])
+    async def wiki_pages() -> dict:
+        """列出最近一次生成的 Memory Wiki 页面。"""
+        manifest_path = Path(state.wiki_path) / "manifest.json"
+        if not manifest_path.exists():
+            return {
+                "format": "4d-biomem-memory-wiki",
+                "generated_at": None,
+                "page_count": 0,
+                "pages": [],
+            }
+        try:
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(500, f"wiki manifest is invalid: {exc}") from exc
+
+    @app.get("/v1/wiki/page", dependencies=[Depends(verify_api_key)])
+    async def wiki_page(path: str) -> dict:
+        """读取单个 Memory Wiki Markdown 页面。"""
+        root = Path(state.wiki_path).resolve()
+        candidate = (root / path).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise HTTPException(400, "invalid wiki page path")
+        if candidate.suffix != ".md":
+            raise HTTPException(400, "wiki page must be a Markdown file")
+        if not candidate.exists() or not candidate.is_file():
+            raise HTTPException(404, "wiki page not found")
+        rel_path = candidate.relative_to(root).as_posix()
+        return {
+            "path": rel_path,
+            "content": candidate.read_text(encoding="utf-8"),
+        }
 
     @app.post("/v1/memory/retrieve", dependencies=[Depends(verify_api_key)])
     async def retrieve_memory(req: RetrieveRequest) -> dict:

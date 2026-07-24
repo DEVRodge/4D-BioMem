@@ -39,6 +39,7 @@ class Settings:
     # ── 存储路径 ─────────────────────────────────────────────────
     db_path: str = "/data/biomem.db"
     vector_path: str = "/data/vector_store"
+    wiki_path: str = "/data/wiki"
     prefer_chroma: bool = False
 
     # ── 算法超参 ─────────────────────────────────────────────────
@@ -64,6 +65,7 @@ class Settings:
             api_key=_env("API_KEY", ""),
             db_path=_env("DB_PATH", "/data/biomem.db"),
             vector_path=_env("VECTOR_PATH", "/data/vector_store"),
+            wiki_path=_env("WIKI_PATH", "/data/wiki"),
             prefer_chroma=_env_bool("PREFER_CHROMA", False),
             lambda_=float(_env("LAMBDA", "0.05")),
             theta_prune=float(_env("THETA_PRUNE", "0.5")),

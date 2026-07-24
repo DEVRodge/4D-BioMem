@@ -219,8 +219,9 @@
       <div class="flex items-center gap-2">
         <button id="tabEnergy" class="view-tab active rounded-lg px-3 py-2 text-xs font-mono">记忆能量</button>
         <button id="tabTree" class="view-tab rounded-lg px-3 py-2 text-xs font-mono">记忆树</button>
+        <button id="tabWiki" class="view-tab rounded-lg px-3 py-2 text-xs font-mono">Memory Wiki</button>
       </div>
-      <div class="text-xs font-mono text-slate-500">SQLite 行 · JSON 元数据 · 虚拟 .mem 分组</div>
+      <div class="text-xs font-mono text-slate-500">SQLite 行 · JSON 元数据 · 虚拟 .mem 分组 · 派生 Markdown Wiki</div>
     </section>
 
     <!-- Memory grid -->
@@ -268,6 +269,34 @@
       </div>
     </section>
 
+    <!-- Memory wiki -->
+    <section id="wikiView" class="hidden">
+      <div class="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-4">
+        <div class="glass rounded-xl p-4 min-h-[560px]">
+          <div class="flex items-center justify-between mb-3 gap-3">
+            <div>
+              <h2 class="text-sm font-mono text-slate-300">Memory Wiki</h2>
+              <div id="wikiMeta" class="text-xs text-slate-500 font-mono mt-1">—</div>
+            </div>
+            <button id="wikiBuildBtn" class="rounded-lg px-3 py-2 text-xs font-mono border border-cyan-400/30 bg-cyan-950/30 text-cyan-200 hover:bg-cyan-900/40">
+              重新生成
+            </button>
+          </div>
+          <div id="wikiPages" class="space-y-1 text-sm font-mono"></div>
+        </div>
+        <div class="glass rounded-xl p-4 min-h-[560px]">
+          <div class="flex items-start justify-between gap-3 mb-4">
+            <div>
+              <div id="wikiTitle" class="text-lg font-bold text-cyan-200 font-mono">未选择</div>
+              <div id="wikiPath" class="text-xs text-slate-500 font-mono mt-1">—</div>
+            </div>
+            <div id="wikiPageMeta" class="text-xs text-slate-400 font-mono text-right">—</div>
+          </div>
+          <pre id="wikiContent" class="rounded-lg border border-slate-800/80 bg-slate-950/40 p-4 min-h-[460px] overflow-auto text-sm text-slate-100 leading-relaxed whitespace-pre-wrap font-mono"></pre>
+        </div>
+      </div>
+    </section>
+
     <footer class="mt-10 text-center text-xs text-slate-600 font-mono">
       4D-BioMem · 突触权重衰减 W(t)=I·ln(1+C)·e^(-λΔt) · 双通路唤醒 · Synaptic Pruning
     </footer>
@@ -284,6 +313,8 @@ let selectedVirtualPath = null;
 let activeView = 'energy';
 let collapsedFolders = new Set();
 let memoryEvents = null;
+let wikiManifest = null;
+let selectedWikiPath = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -363,9 +394,12 @@ function switchView(view) {
   activeView = view;
   $('energyView').classList.toggle('hidden', view !== 'energy');
   $('treeView').classList.toggle('hidden', view !== 'tree');
+  $('wikiView').classList.toggle('hidden', view !== 'wiki');
   $('tabEnergy').classList.toggle('active', view === 'energy');
   $('tabTree').classList.toggle('active', view === 'tree');
+  $('tabWiki').classList.toggle('active', view === 'wiki');
   if (view === 'tree' && memoryTree) renderMemoryTree(memoryTree);
+  if (view === 'wiki') loadWikiPages(false);
   setTimeout(() => { donut?.resize(); bar?.resize(); }, 0);
 }
 
@@ -512,6 +546,86 @@ function renderMemoryEvents(data) {
         <div class="space-y-2">${rows}</div>
       </section>`;
   }).join('');
+}
+
+function renderWikiPages(data) {
+  wikiManifest = data;
+  const pages = data?.pages || [];
+  $('wikiMeta').textContent = data?.generated_at ? `${pages.length} pages · ${new Date(data.generated_at).toLocaleString('zh-CN', {hour12:false})}` : '尚未生成';
+  if (!pages.length) {
+    $('wikiPages').innerHTML = `<div class="text-slate-500 text-sm font-mono py-8 text-center">暂无 Wiki 页面</div>`;
+    $('wikiTitle').textContent = '未生成';
+    $('wikiPath').textContent = '—';
+    $('wikiPageMeta').textContent = '—';
+    $('wikiContent').textContent = '点击“重新生成”后，4D-BioMem 会从现有记忆和每日片段生成本地 Markdown Wiki。';
+    return;
+  }
+  if (!selectedWikiPath || !pages.some(page => page.path === selectedWikiPath)) {
+    selectedWikiPath = pages[0].path;
+  }
+  $('wikiPages').innerHTML = pages.map(page => {
+    const active = page.path === selectedWikiPath ? 'active' : '';
+    const count = (page.source_memory_ids?.length || 0) + (page.source_event_ids?.length || 0);
+    return `
+      <button class="wiki-page ${active} w-full text-left rounded-lg border border-transparent px-2 py-2 transition-colors ${active ? 'tree-file active' : 'text-slate-300 hover:bg-slate-900/60'}"
+              data-path="${escapeHTML(page.path)}">
+        <div class="flex items-center justify-between gap-2">
+          <span class="truncate">▤ ${escapeHTML(page.title || page.path)}</span>
+          <span class="text-[10px] text-slate-500">${count}</span>
+        </div>
+        <div class="text-[10px] text-slate-600 truncate mt-0.5">${escapeHTML(page.path)}</div>
+      </button>`;
+  }).join('');
+  loadWikiPage(selectedWikiPath);
+}
+
+async function loadWikiPages(showLog=true) {
+  try {
+    const res = await fetch('/v1/wiki/pages');
+    const data = await res.json();
+    renderWikiPages(data);
+    if (showLog) logMsg(`Wiki 页面列表已刷新：${data.page_count || 0} 页`, 'cyan');
+  } catch (e) {
+    logMsg('Wiki 页面列表读取失败: ' + e.message, 'rose');
+  }
+}
+
+async function loadWikiPage(path) {
+  if (!path) return;
+  try {
+    const res = await fetch('/v1/wiki/page?path=' + encodeURIComponent(path));
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    const page = (wikiManifest?.pages || []).find(item => item.path === data.path);
+    $('wikiTitle').textContent = page?.title || data.path;
+    $('wikiPath').textContent = data.path;
+    $('wikiPageMeta').textContent = page ? `${page.source_memory_ids.length} memories · ${page.source_event_ids.length} events` : '—';
+    $('wikiContent').textContent = data.content;
+  } catch (e) {
+    logMsg('Wiki 页面读取失败: ' + e.message, 'rose');
+  }
+}
+
+async function buildWiki() {
+  const btn = $('wikiBuildBtn');
+  btn.disabled = true;
+  logMsg('开始生成 Memory Wiki …', 'amber');
+  try {
+    const res = await fetch('/v1/wiki/build', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    selectedWikiPath = 'index.md';
+    renderWikiPages(data);
+    logMsg(`Memory Wiki 已生成：${data.page_count} 页`, 'emerald');
+  } catch (e) {
+    logMsg('Memory Wiki 生成失败: ' + e.message, 'rose');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function renderCells(data) {
@@ -670,6 +784,7 @@ window.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('resize', () => { donut.resize(); bar.resize(); });
   $('tabEnergy').addEventListener('click', () => switchView('energy'));
   $('tabTree').addEventListener('click', () => switchView('tree'));
+  $('tabWiki').addEventListener('click', () => switchView('wiki'));
   $('treeBrowser').addEventListener('click', (ev) => {
     const btn = ev.target.closest('.tree-file');
     if (btn) {
@@ -684,10 +799,18 @@ window.addEventListener('DOMContentLoaded', () => {
     else collapsedFolders.add(path);
     if (memoryTree) renderMemoryTree(memoryTree);
   });
+  $('wikiPages').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('.wiki-page');
+    if (!btn) return;
+    selectedWikiPath = btn.dataset.path;
+    if (wikiManifest) renderWikiPages(wikiManifest);
+  });
+  $('wikiBuildBtn').addEventListener('click', buildWiki);
   $('pruneBtn').addEventListener('click', doPrune);
   $('autoRefresh').addEventListener('change', setupAuto);
   logMsg('看板启动 · 连接 4D-BioMem 监控接口', 'cyan');
   refresh().then(() => logMsg(`载入 ${lastCells.size} 条记忆`, 'emerald'));
+  loadWikiPages(false);
   setupAuto();
 });
 </script>

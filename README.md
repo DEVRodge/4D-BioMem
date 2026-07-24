@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](https://www.docker.com/)
-[![Version](https://img.shields.io/badge/release-v1.6.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.6.0)
+[![Version](https://img.shields.io/badge/release-v1.7.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.7.0)
 
 **4D-BioMem** 是一个受生物突触机制启发的 Agent 长效记忆系统。它模拟人脑的"新陈代谢"——记忆有强弱之分，高频使用的记忆被强化，低频噪声被物理抹除，安全底线永久锁定。
 
@@ -275,6 +275,7 @@ recall_memory("用户有什么过敏史")
 | `API_KEY` | 空 | 服务鉴权 Key（空=不鉴权，适合内网） |
 | `DB_PATH` | `/data/biomem.db` | SQLite 数据库路径 |
 | `VECTOR_PATH` | `/data/vector_store` | 向量存储路径 |
+| `WIKI_PATH` | `/data/wiki` | Memory Wiki 生成目录；Markdown 是派生产物，不是主存储 |
 | `LAMBDA` | `0.05` | 遗忘衰减因子 |
 | `THETA_PRUNE` | `0.5` | 剪枝权重阈值 |
 | `TAU` | `1.0` | 软检索激活阈值 |
@@ -367,6 +368,9 @@ curl -s "http://localhost:8000/v1/memory/list" -G -d user_id=hermes | python3 -m
 | `POST` | `/v1/memory/retrieve` | 双通路唤醒检索，支持 `query_tags` F 轴过滤、`query_entities` 实体 boost、`agent_id` 隔离 |
 | `POST` | `/v1/memory/synthesize` | 跨记忆合成问答：检索 Top-K → LLM 综合回答（Mock 模式返回拼接摘要） |
 | `POST` | `/v1/memory/prune` | 触发新陈代谢——抹除死亡记忆 |
+| `POST` | `/v1/wiki/build` | 从现有记忆和每日片段生成本地 Markdown Memory Wiki |
+| `GET` | `/v1/wiki/pages` | 列出最近一次生成的 Wiki 页面清单 |
+| `GET` | `/v1/wiki/page` | 读取单个 Wiki Markdown 页面内容 |
 | `GET` | `/v1/monitor/cells` | 全量细胞实时监控 |
 | `POST` | `/v1/monitor/system_status` | 系统整体指标 |
 | `GET` | `/dashboard/` | 可视化监控面板 |
@@ -434,6 +438,21 @@ curl -X POST http://localhost:8000/v1/memory/synthesize \
   }'
 ```
 
+#### 生成并读取 Memory Wiki
+
+```bash
+# 生成 /data/wiki 下的 Markdown Wiki
+curl -X POST http://localhost:8000/v1/wiki/build \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "hermes"}'
+
+# 查看页面清单
+curl http://localhost:8000/v1/wiki/pages | python3 -m json.tool
+
+# 读取某个页面
+curl "http://localhost:8000/v1/wiki/page?path=index.md"
+```
+
 ---
 
 ## 🧪 测试
@@ -453,6 +472,9 @@ python3 test_retrieval.py
 # API - 端到端
 python3 test_api.py
 
+# v1.7 - Memory Wiki
+python3 -m unittest test_memory_wiki.py -v
+
 # 科学评测 - 30 轮
 python3 run_benchmark.py
 
@@ -469,6 +491,8 @@ python3 experiment/runner.py
 - **实时权重列表**——每条记忆的权重、频次、距上次唤醒时间
 - **一键新陈代谢**——加速衰减，看闲聊记忆"灰飞烟灭"动画
 - **ECharts 实时图表**——记忆构成饼图 + 权重分布对数柱状图
+- **记忆树查看**——按用户、Agent、项目、虚拟 `.mem` 文件浏览原始记忆
+- **Memory Wiki**——从现有记忆和每日片段生成 Markdown 页面，并在 Web 端查看
 - **系统指标卡片**——有效记忆数、风险锁定率、今日剪枝数
 
 ---
@@ -481,7 +505,8 @@ python3 experiment/runner.py
 ├── core/
 │   ├── memory_cell.py          MemoryCell + SynapticPruningEngine
 │   ├── retrieval.py             DualPathwayRetriever（双通路检索）
-│   └── llm_auditor.py           OpenAILLMAuditor + Mock（自动降级）
+│   ├── llm_auditor.py           OpenAILLMAuditor + Mock（自动降级）
+│   └── memory_wiki.py           Memory Wiki Markdown 派生层
 ├── storage/
 │   └── db_manager.py            DBManager（SQLite + 向量库，线程安全）
 ├── api/
@@ -491,7 +516,7 @@ python3 experiment/runner.py
 │   └── hermes_tools.py          Hermes Agent 独立工具（httpx 直连）
 ├── experiment/                   A/B/C 三组对照组实验框架
 ├── test_core.py / test_storage.py / test_retrieval.py
-├── test_api.py / run_benchmark.py
+├── test_api.py / test_memory_wiki.py / run_benchmark.py
 ├── requirements.txt             依赖清单
 ├── Dockerfile / docker-compose.yml / .env.example
 └── SPEC.md                      技术规格说明书
@@ -520,6 +545,28 @@ httpx>=0.28.0       # 仅客户端工具需要
 ---
 
 ## 📋 更新日志
+
+### v1.7.0 (2026-07-24) — OpenWiki 风格 Memory Wiki
+
+**新增特性**
+- **Memory Wiki 生成器**：新增 `core/memory_wiki.py`，从 `memory_cells` 与 `memory_events` 生成本地 Markdown 页面和 `manifest.json`
+- **OpenWiki 风格页面结构**：生成 `index.md`、用户/Agent 首页、项目时间线、每日片段页，页面 front matter 保留来源记忆 id 与事件 id，便于追溯和后续 diff
+- **Wiki API**：新增 `POST /v1/wiki/build`、`GET /v1/wiki/pages`、`GET /v1/wiki/page`，支持生成、列出和读取 Memory Wiki 页面
+- **Dashboard Wiki 视图**：`/dashboard/` 新增 “Memory Wiki” 标签页，可重新生成 Wiki、浏览页面清单、查看 Markdown 内容
+- **Docker 友好路径**：新增 `WIKI_PATH` 配置，默认 `/data/wiki`，会随现有 `/data` 持久化卷保存
+
+**设计约束**
+- Markdown Wiki 是派生产物，不替代 SQLite + 向量库双轨主存储
+- 生成 Wiki 不会删除、剪枝或修改现有长期记忆和每日片段，只写入 `WIKI_PATH`
+- 页面读取包含路径逃逸保护，只允许读取 Wiki 目录内的 `.md` 文件
+
+**变更文件**
+- `core/memory_wiki.py`: 新增 Markdown Wiki 生成器
+- `api/main.py`: 新增 `WikiBuildRequest` 与 `/v1/wiki/*` 端点，API 版本升至 `1.7.0`
+- `config.py`: 新增 `WIKI_PATH`
+- `api/static/index.html`: 新增 “Memory Wiki” 标签页、生成按钮和 Markdown 查看器
+- `test_memory_wiki.py`: 新增 builder 与 API 回归测试
+- `README.md`: 更新版本徽章、API 列表、配置项和更新日志
 
 ### v1.6.0 (2026-07-23) — 每日片段摄取与归档
 
