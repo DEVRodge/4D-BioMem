@@ -14,6 +14,8 @@
   POST /v1/wiki/build       生成 OpenWiki 风格 Memory Wiki（派生 Markdown）
   GET  /v1/wiki/pages       列出最近一次生成的 Wiki 页面
   GET  /v1/wiki/page        读取单个 Wiki 页面内容
+  GET  /v1/maintenance/status 自动维护状态
+  POST /v1/maintenance/run_once 手动触发一次补账整理
   GET  /health              健康检查
 
 LLM/Embedding 默认用 Mock（无需 API Key）；设置 LLM_BACKEND=openai + OPENAI_API_KEY 启用 OpenAI。
@@ -30,6 +32,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, Header
@@ -231,11 +234,17 @@ class AppState:
     """单例式应用状态：DB 管理器 + 审计器 + 嵌入器 + 写入队列。"""
 
     def __init__(self, db_path: str, vector_path: str, wiki_path: str, prefer_chroma: bool = False,
+                 auto_maintenance_enabled: bool = True, maintenance_time: str = "03:30",
+                 maintenance_timezone: str = "Asia/Shanghai", maintenance_interval_minutes: int = 30,
                  seed: bool = True) -> None:
         self.db_path = db_path
         self.vector_path = vector_path
         self.wiki_path = wiki_path
         self.prefer_chroma = prefer_chroma
+        self.auto_maintenance_enabled = auto_maintenance_enabled
+        self.maintenance_time = maintenance_time
+        self.maintenance_timezone = maintenance_timezone
+        self.maintenance_interval_minutes = max(1, maintenance_interval_minutes)
         self.seed = seed
         self.db: DBManager | None = None
         # 根据配置选择 OpenAI 或 Mock 后端
@@ -248,6 +257,9 @@ class AppState:
         self.write_queue: asyncio.Queue[tuple[str, str, str, str, dict | None]] | None = None
         # Queue: (request_id, user_id, agent_id, content, task_tags)
         self._worker_task: asyncio.Task | None = None
+        self._maintenance_task: asyncio.Task | None = None
+        self._maintenance_lock: asyncio.Lock | None = None
+        self.last_maintenance_run: dict[str, Any] | None = None
         self._stop = False
         # 剪枝计数（监控指标用）
         self.pruned_total = 0
@@ -259,6 +271,7 @@ class AppState:
             db_path=self.db_path, vector_path=self.vector_path, prefer_chroma=self.prefer_chroma
         )
         self.write_queue = asyncio.Queue()
+        self._maintenance_lock = asyncio.Lock()
         if self.seed:
             self.seed_if_empty()
 
@@ -315,14 +328,217 @@ class AppState:
         self._stop = False
         self._worker_task = asyncio.create_task(self._ingestion_worker())
 
+    def start_maintenance(self) -> None:
+        """启动自动维护后台任务：启动补账 + 周期补账。"""
+        if not self.auto_maintenance_enabled:
+            return
+        self._maintenance_task = asyncio.create_task(self._maintenance_loop())
+
     async def shutdown(self) -> None:
         self._stop = True
+        if self._maintenance_task is not None:
+            if self._maintenance_lock is not None and self._maintenance_lock.locked():
+                try:
+                    await asyncio.wait_for(self._maintenance_task, timeout=30)
+                except asyncio.TimeoutError:
+                    self._maintenance_task.cancel()
+                    try:
+                        await self._maintenance_task
+                    except asyncio.CancelledError:
+                        pass
+            else:
+                self._maintenance_task.cancel()
+                try:
+                    await self._maintenance_task
+                except asyncio.CancelledError:
+                    pass
         if self.write_queue is not None:
             await self.write_queue.put(("__stop__", "", "", "", None))
         if self._worker_task is not None:
             await self._worker_task
         if self.db is not None:
             self.db.close()
+
+    def _maintenance_zone(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(self.maintenance_timezone)
+        except ZoneInfoNotFoundError:
+            return ZoneInfo("UTC")
+
+    def _maintenance_today(self, now: datetime | None = None) -> str:
+        base = now or datetime.now(tz=timezone.utc)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        return base.astimezone(self._maintenance_zone()).date().isoformat()
+
+    def _next_daily_run_at(self, now: datetime | None = None) -> str:
+        base = now or datetime.now(tz=timezone.utc)
+        zone = self._maintenance_zone()
+        local_now = base.astimezone(zone)
+        try:
+            hour_s, minute_s = self.maintenance_time.split(":", 1)
+            hour, minute = int(hour_s), int(minute_s)
+        except ValueError:
+            hour, minute = 3, 30
+        candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= local_now:
+            candidate += timedelta(days=1)
+        return candidate.isoformat()
+
+    async def archive_event_group(
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        date: str,
+        task_tags: dict | None = None,
+    ) -> dict[str, Any]:
+        """把一个 user/agent/date 的未归档片段聚合为长期记忆。"""
+        if self.db is None:
+            raise RuntimeError("service not ready")
+        events = self.db.list_events(
+            user_id=user_id,
+            date=date,
+            archived=False,
+            agent_id=agent_id,
+            limit=2000,
+        )
+        if not events:
+            return {
+                "status": "empty",
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "date": date,
+                "event_count": 0,
+            }
+
+        content = _archive_content(user_id, agent_id, date, events)
+        audit = await self.auditor.audit(content)
+        final_tags = {
+            **audit["task_tags"],
+            **(task_tags or {}),
+            "type": "daily_archive",
+            "date": date,
+            "source": "memory_events",
+        }
+        entities = audit.get("entities", [])
+        vector = await self.embedder.embed(content)
+        now = datetime.now(tz=timezone.utc)
+        cell = MemoryCell(
+            content=content,
+            user_id=user_id,
+            agent_id=agent_id,
+            is_risk=bool(audit["is_risk"]),
+            base_intensity=float(audit["base_intensity"]),
+            created_at=now,
+            last_accessed_at=now,
+            task_tags=final_tags,
+            entities=entities,
+            id=str(uuid.uuid4()),
+        )
+        cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
+        self.db.save_memory(cell, vector)
+        self.db.mark_events_archived([event["id"] for event in events], cell.id)
+        return {
+            "status": "archived",
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "date": date,
+            "event_count": len(events),
+            "archive_cell_id": cell.id,
+            "content": content,
+        }
+
+    async def run_maintenance_once(
+        self,
+        *,
+        trigger: str = "manual",
+        include_today: bool = False,
+        today: str | None = None,
+    ) -> dict[str, Any]:
+        """执行一次自愈式维护：补归档历史片段，然后刷新 Wiki。"""
+        if self.db is None or self._maintenance_lock is None:
+            raise RuntimeError("service not ready")
+        started_at = datetime.now(tz=timezone.utc).isoformat()
+        local_today = today or self._maintenance_today()
+        async with self._maintenance_lock:
+            groups = self.db.list_unarchived_event_groups(
+                today=local_today,
+                include_today=include_today,
+            )
+            archived_groups = []
+            errors = []
+            for group in groups:
+                try:
+                    result = await self.archive_event_group(
+                        user_id=str(group["user_id"]),
+                        agent_id=str(group["agent_id"]),
+                        date=str(group["date"]),
+                        task_tags={"maintenance_trigger": trigger},
+                    )
+                    if result["status"] == "archived":
+                        archived_groups.append(result)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({
+                        "user_id": group["user_id"],
+                        "agent_id": group["agent_id"],
+                        "date": group["date"],
+                        "error": str(exc),
+                    })
+
+            cells = self.db.load_all_active_cells()
+            events = self.db.list_events(limit=5000)
+            manifest = build_memory_wiki(
+                cells=cells,
+                events=events,
+                output_dir=self.wiki_path,
+                now=datetime.now(tz=timezone.utc),
+            )
+            result = {
+                "status": "completed" if not errors else "completed_with_errors",
+                "trigger": trigger,
+                "started_at": started_at,
+                "finished_at": datetime.now(tz=timezone.utc).isoformat(),
+                "today": local_today,
+                "include_today": include_today,
+                "groups_scanned": len(groups),
+                "groups_archived": len(archived_groups),
+                "events_archived": sum(item["event_count"] for item in archived_groups),
+                "archive_cell_ids": [item["archive_cell_id"] for item in archived_groups],
+                "wiki_page_count": manifest["page_count"],
+                "errors": errors,
+            }
+            self.last_maintenance_run = result
+            return result
+
+    def maintenance_status(self, now: datetime | None = None) -> dict[str, Any]:
+        """返回自动维护调度状态。"""
+        return {
+            "enabled": self.auto_maintenance_enabled,
+            "maintenance_time": self.maintenance_time,
+            "maintenance_timezone": self.maintenance_timezone,
+            "periodic_scan_minutes": self.maintenance_interval_minutes,
+            "next_daily_run_at": self._next_daily_run_at(now),
+            "last_run": self.last_maintenance_run,
+        }
+
+    async def _maintenance_loop(self) -> None:
+        try:
+            await self.run_maintenance_once(trigger="startup")
+            while not self._stop:
+                await asyncio.sleep(self.maintenance_interval_minutes * 60)
+                if self._stop:
+                    break
+                await self.run_maintenance_once(trigger="periodic")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.last_maintenance_run = {
+                "status": "failed",
+                "trigger": "background",
+                "finished_at": datetime.now(tz=timezone.utc).isoformat(),
+                "error": str(exc),
+            }
 
     async def _ingestion_worker(self) -> None:
         """后台消费者：从队列取 (req_id, user_id, agent_id, content, user_tags)，跑审计 → save_memory。"""
@@ -392,6 +608,12 @@ class WikiBuildRequest(BaseModel):
     agent_id: str | None = None
 
 
+class MaintenanceRunRequest(BaseModel):
+    trigger: str = "manual"
+    include_today: bool = False
+    today: str | None = None
+
+
 class RetrieveRequest(BaseModel):
     user_id: str
     query: str
@@ -426,6 +648,10 @@ def create_app(
     db_path: str | None = None,
     vector_path: str | None = None,
     wiki_path: str | None = None,
+    auto_maintenance_enabled: bool | None = None,
+    maintenance_time: str | None = None,
+    maintenance_timezone: str | None = None,
+    maintenance_interval_minutes: int | None = None,
     prefer_chroma: bool | None = None,
     seed: bool | None = None,
 ) -> FastAPI:
@@ -433,23 +659,39 @@ def create_app(
     db_path = db_path or settings.db_path
     vector_path = vector_path or settings.vector_path
     wiki_path = wiki_path or settings.wiki_path
+    if auto_maintenance_enabled is None:
+        auto_maintenance_enabled = settings.auto_maintenance_enabled
+    maintenance_time = maintenance_time or settings.maintenance_time
+    maintenance_timezone = maintenance_timezone or settings.maintenance_timezone
+    maintenance_interval_minutes = maintenance_interval_minutes or settings.maintenance_interval_minutes
     if prefer_chroma is None:
         prefer_chroma = settings.prefer_chroma
     if seed is None:
         seed = settings.seed
 
-    state = AppState(db_path, vector_path, wiki_path, prefer_chroma, seed=seed)
+    state = AppState(
+        db_path,
+        vector_path,
+        wiki_path,
+        prefer_chroma,
+        auto_maintenance_enabled=auto_maintenance_enabled,
+        maintenance_time=maintenance_time,
+        maintenance_timezone=maintenance_timezone,
+        maintenance_interval_minutes=maintenance_interval_minutes,
+        seed=seed,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         state.startup()
         state.start_worker()
+        state.start_maintenance()
         try:
             yield
         finally:
             await state.shutdown()
 
-    app = FastAPI(title="4D-BioMem API", version="1.7.0", lifespan=lifespan)
+    app = FastAPI(title="4D-BioMem API", version="1.8.0", lifespan=lifespan)
     app.state.state = state
     _register_routes(app, state)
     # 前端看板静态资源挂载在 /dashboard（访问 /dashboard 即打开 index.html）
@@ -527,58 +769,12 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
         if state.db is None:
             raise HTTPException(503, "service not ready")
         agent_id = req.agent_id or "biomem-api"
-        events = state.db.list_events(
+        return await state.archive_event_group(
             user_id=req.user_id,
+            agent_id=agent_id,
             date=req.date,
-            archived=False,
-            agent_id=agent_id,
-            limit=2000,
+            task_tags=req.task_tags,
         )
-        if not events:
-            return {
-                "status": "empty",
-                "user_id": req.user_id,
-                "agent_id": agent_id,
-                "date": req.date,
-                "event_count": 0,
-            }
-
-        content = _archive_content(req.user_id, agent_id, req.date, events)
-        audit = await state.auditor.audit(content)
-        final_tags = {
-            **audit["task_tags"],
-            **(req.task_tags or {}),
-            "type": "daily_archive",
-            "date": req.date,
-            "source": "memory_events",
-        }
-        entities = audit.get("entities", [])
-        vector = await state.embedder.embed(content)
-        now = datetime.now(tz=timezone.utc)
-        cell = MemoryCell(
-            content=content,
-            user_id=req.user_id,
-            agent_id=agent_id,
-            is_risk=bool(audit["is_risk"]),
-            base_intensity=float(audit["base_intensity"]),
-            created_at=now,
-            last_accessed_at=now,
-            task_tags=final_tags,
-            entities=entities,
-            id=str(uuid.uuid4()),
-        )
-        cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
-        state.db.save_memory(cell, vector)
-        state.db.mark_events_archived([event["id"] for event in events], cell.id)
-        return {
-            "status": "archived",
-            "user_id": req.user_id,
-            "agent_id": agent_id,
-            "date": req.date,
-            "event_count": len(events),
-            "archive_cell_id": cell.id,
-            "content": content,
-        }
 
     @app.get("/v1/memory/list", dependencies=[Depends(verify_api_key)])
     async def list_memory(user_id: str) -> dict:
@@ -664,6 +860,22 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
             "path": rel_path,
             "content": candidate.read_text(encoding="utf-8"),
         }
+
+    @app.get("/v1/maintenance/status", dependencies=[Depends(verify_api_key)])
+    async def maintenance_status() -> dict:
+        """返回自动归档与 Wiki 刷新的维护状态。"""
+        return state.maintenance_status()
+
+    @app.post("/v1/maintenance/run_once", dependencies=[Depends(verify_api_key)])
+    async def maintenance_run_once(req: MaintenanceRunRequest) -> dict:
+        """手动触发一次维护：归档历史片段并刷新 Memory Wiki。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        return await state.run_maintenance_once(
+            trigger=req.trigger,
+            include_today=req.include_today,
+            today=req.today,
+        )
 
     @app.post("/v1/memory/retrieve", dependencies=[Depends(verify_api_key)])
     async def retrieve_memory(req: RetrieveRequest) -> dict:

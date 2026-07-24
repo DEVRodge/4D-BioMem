@@ -214,6 +214,22 @@
     <!-- Log -->
     <div id="log" class="glass rounded-xl px-4 py-2 mb-6 text-xs font-mono text-slate-400 h-20 overflow-y-auto"></div>
 
+    <!-- Auto maintenance -->
+    <section class="glass rounded-xl p-4 mb-6 flex flex-wrap items-center gap-4">
+      <div class="flex-1 min-w-[260px]">
+        <div class="text-sm text-slate-300 font-mono">自动整理 · 每日归档与 Wiki 刷新</div>
+        <div class="text-[11px] text-slate-500 font-mono mt-1">
+          状态 <span id="maintEnabled" class="text-cyan-300">—</span>
+          · 下次 <span id="maintNext" class="text-slate-300">—</span>
+          · 上次 <span id="maintLast" class="text-slate-300">—</span>
+        </div>
+      </div>
+      <div class="text-xs font-mono text-slate-500 min-w-[220px]" id="maintSummary">—</div>
+      <button id="maintRunBtn" class="rounded-lg px-4 py-2 text-xs font-mono border border-emerald-400/30 bg-emerald-950/30 text-emerald-200 hover:bg-emerald-900/40">
+        立即整理
+      </button>
+    </section>
+
     <!-- View switch -->
     <section class="flex items-center justify-between mb-3 gap-3 flex-wrap">
       <div class="flex items-center gap-2">
@@ -315,6 +331,7 @@ let collapsedFolders = new Set();
 let memoryEvents = null;
 let wikiManifest = null;
 let selectedWikiPath = null;
+let maintenanceStatus = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -548,6 +565,58 @@ function renderMemoryEvents(data) {
   }).join('');
 }
 
+function renderMaintenanceStatus(data) {
+  maintenanceStatus = data;
+  $('maintEnabled').textContent = data.enabled ? '已启用' : '已关闭';
+  $('maintEnabled').className = data.enabled ? 'text-emerald-300' : 'text-slate-500';
+  $('maintNext').textContent = data.next_daily_run_at
+    ? new Date(data.next_daily_run_at).toLocaleString('zh-CN', {hour12:false})
+    : '—';
+  if (!data.last_run) {
+    $('maintLast').textContent = '尚未运行';
+    $('maintSummary').textContent = `${data.maintenance_time} ${data.maintenance_timezone} · 每 ${data.periodic_scan_minutes} 分钟补账扫描`;
+    return;
+  }
+  const last = data.last_run;
+  $('maintLast').textContent = new Date(last.finished_at || last.started_at).toLocaleString('zh-CN', {hour12:false});
+  const errors = last.errors?.length || 0;
+  $('maintSummary').textContent = `归档 ${last.groups_archived || 0} 组 / ${last.events_archived || 0} 片段 · Wiki ${last.wiki_page_count || 0} 页${errors ? ' · 错误 ' + errors : ''}`;
+}
+
+async function loadMaintenanceStatus(showLog=false) {
+  try {
+    const res = await fetch('/v1/maintenance/status');
+    const data = await res.json();
+    renderMaintenanceStatus(data);
+    if (showLog) logMsg('自动整理状态已刷新', 'cyan');
+  } catch (e) {
+    logMsg('自动整理状态读取失败: ' + e.message, 'rose');
+  }
+}
+
+async function runMaintenance() {
+  const btn = $('maintRunBtn');
+  btn.disabled = true;
+  logMsg('开始执行自动整理补账 …', 'amber');
+  try {
+    const res = await fetch('/v1/maintenance/run_once', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({trigger:'dashboard'})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    logMsg(`整理完成：归档 ${data.groups_archived} 组 / ${data.events_archived} 片段，Wiki ${data.wiki_page_count} 页`, data.errors?.length ? 'amber' : 'emerald');
+    await loadMaintenanceStatus();
+    await loadWikiPages(false);
+    await refresh();
+  } catch (e) {
+    logMsg('自动整理失败: ' + e.message, 'rose');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function renderWikiPages(data) {
   wikiManifest = data;
   const pages = data?.pages || [];
@@ -728,21 +797,24 @@ async function refresh(showLog=false) {
   if (refreshing) return;
   refreshing = true;
   try {
-    const [cellsRes, statusRes, treeRes, eventsRes] = await Promise.all([
+    const [cellsRes, statusRes, treeRes, eventsRes, maintRes] = await Promise.all([
       fetch('/v1/monitor/cells'),
       fetch('/v1/monitor/system_status', {method:'POST'}),
       fetch('/v1/memory/tree'),
-      fetch('/v1/memory/events?limit=200')
+      fetch('/v1/memory/events?limit=200'),
+      fetch('/v1/maintenance/status')
     ]);
     const cells = await cellsRes.json();
     const status = await statusRes.json();
     const tree = await treeRes.json();
     const events = await eventsRes.json();
+    const maintenance = await maintRes.json();
     renderStatus(status);
     renderCells(cells);
     renderCharts(cells);
     renderMemoryTree(tree);
     renderMemoryEvents(events);
+    renderMaintenanceStatus(maintenance);
   } catch (e) {
     logMsg('刷新失败: ' + e.message, 'rose');
   } finally {
@@ -806,6 +878,7 @@ window.addEventListener('DOMContentLoaded', () => {
     if (wikiManifest) renderWikiPages(wikiManifest);
   });
   $('wikiBuildBtn').addEventListener('click', buildWiki);
+  $('maintRunBtn').addEventListener('click', runMaintenance);
   $('pruneBtn').addEventListener('click', doPrune);
   $('autoRefresh').addEventListener('change', setupAuto);
   logMsg('看板启动 · 连接 4D-BioMem 监控接口', 'cyan');

@@ -100,6 +100,7 @@ class MemoryWikiApiTest(unittest.TestCase):
             wiki_path=os.path.join(self.tmp, "wiki"),
             prefer_chroma=False,
             seed=False,
+            auto_maintenance_enabled=False,
         )
         self.client_ctx = TestClient(self.app)
         self.client = self.client_ctx.__enter__()

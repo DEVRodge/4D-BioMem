@@ -484,6 +484,42 @@ class DBManager:
             ).fetchall()
         return [self._event_row_to_dict(row) for row in rows]
 
+    def list_unarchived_event_groups(
+        self,
+        *,
+        today: str | None = None,
+        include_today: bool = False,
+    ) -> list[dict[str, Any]]:
+        """列出待归档事件分组，默认只返回今天之前的未归档片段。"""
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        clauses = ["archived = 0"]
+        params: list[Any] = []
+        if today and not include_today:
+            clauses.append("substr(occurred_at, 1, 10) < ?")
+            params.append(today)
+        where = " AND ".join(clauses)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT user_id, agent_id, substr(occurred_at, 1, 10) AS date, COUNT(*) AS event_count
+                FROM memory_events
+                WHERE {where}
+                GROUP BY user_id, agent_id, date
+                ORDER BY date ASC, user_id ASC, agent_id ASC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            {
+                "user_id": row["user_id"],
+                "agent_id": row["agent_id"],
+                "date": row["date"],
+                "event_count": int(row["event_count"]),
+            }
+            for row in rows
+        ]
+
     def mark_events_archived(self, event_ids: list[str], archive_cell_id: str) -> None:
         """把片段标记为已归档，并关联生成的长期记忆 cell。"""
         if self._closed:

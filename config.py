@@ -50,6 +50,12 @@ class Settings:
     # ── 日志 ────────────────────────────────────────────────────
     log_level: str = "info"
 
+    # ── 自动维护 ─────────────────────────────────────────────────
+    auto_maintenance_enabled: bool = True
+    maintenance_time: str = "03:30"
+    maintenance_timezone: str = "Asia/Shanghai"
+    maintenance_interval_minutes: int = 30
+
     # ── 演示数据 ─────────────────────────────────────────────────
     seed: bool = True
 
@@ -71,6 +77,10 @@ class Settings:
             theta_prune=float(_env("THETA_PRUNE", "0.5")),
             tau=float(_env("TAU", "1.0")),
             log_level=_env("LOG_LEVEL", "info"),
+            auto_maintenance_enabled=_env_bool("AUTO_MAINTENANCE_ENABLED", True),
+            maintenance_time=_env("MAINTENANCE_TIME", "03:30"),
+            maintenance_timezone=_env("MAINTENANCE_TIMEZONE", "Asia/Shanghai"),
+            maintenance_interval_minutes=int(_env("MAINTENANCE_INTERVAL_MINUTES", "30")),
             seed=_env_bool("SEED", True),
         )
 

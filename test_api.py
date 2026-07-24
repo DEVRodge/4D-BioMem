@@ -42,7 +42,13 @@ def _free_port() -> int:
 
 
 def _start_server(port: int, db_path: str, vec_path: str, holder: dict) -> None:
-    app = create_app(db_path=db_path, vector_path=vec_path, prefer_chroma=False, seed=False)
+    app = create_app(
+        db_path=db_path,
+        vector_path=vec_path,
+        prefer_chroma=False,
+        seed=False,
+        auto_maintenance_enabled=False,
+    )
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
     holder["server"] = server

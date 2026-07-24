@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](https://www.docker.com/)
-[![Version](https://img.shields.io/badge/release-v1.7.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.7.0)
+[![Version](https://img.shields.io/badge/release-v1.8.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.8.0)
 
 **4D-BioMem** 是一个受生物突触机制启发的 Agent 长效记忆系统。它模拟人脑的"新陈代谢"——记忆有强弱之分，高频使用的记忆被强化，低频噪声被物理抹除，安全底线永久锁定。
 
@@ -276,6 +276,10 @@ recall_memory("用户有什么过敏史")
 | `DB_PATH` | `/data/biomem.db` | SQLite 数据库路径 |
 | `VECTOR_PATH` | `/data/vector_store` | 向量存储路径 |
 | `WIKI_PATH` | `/data/wiki` | Memory Wiki 生成目录；Markdown 是派生产物，不是主存储 |
+| `AUTO_MAINTENANCE_ENABLED` | `true` | 是否启用自动整理：启动补账 + 周期补账扫描 |
+| `MAINTENANCE_TIME` | `03:30` | 每日维护时间（按 `MAINTENANCE_TIMEZONE` 解释） |
+| `MAINTENANCE_TIMEZONE` | `Asia/Shanghai` | 自动维护使用的本地日期和维护时间时区 |
+| `MAINTENANCE_INTERVAL_MINUTES` | `30` | 周期补账扫描间隔；用于修复关机、重启、错过凌晨等漏跑 |
 | `LAMBDA` | `0.05` | 遗忘衰减因子 |
 | `THETA_PRUNE` | `0.5` | 剪枝权重阈值 |
 | `TAU` | `1.0` | 软检索激活阈值 |
@@ -371,6 +375,8 @@ curl -s "http://localhost:8000/v1/memory/list" -G -d user_id=hermes | python3 -m
 | `POST` | `/v1/wiki/build` | 从现有记忆和每日片段生成本地 Markdown Memory Wiki |
 | `GET` | `/v1/wiki/pages` | 列出最近一次生成的 Wiki 页面清单 |
 | `GET` | `/v1/wiki/page` | 读取单个 Wiki Markdown 页面内容 |
+| `GET` | `/v1/maintenance/status` | 查看自动整理状态、下次运行时间和上次维护结果 |
+| `POST` | `/v1/maintenance/run_once` | 手动触发一次补账整理：归档历史片段并刷新 Wiki |
 | `GET` | `/v1/monitor/cells` | 全量细胞实时监控 |
 | `POST` | `/v1/monitor/system_status` | 系统整体指标 |
 | `GET` | `/dashboard/` | 可视化监控面板 |
@@ -453,6 +459,18 @@ curl http://localhost:8000/v1/wiki/pages | python3 -m json.tool
 curl "http://localhost:8000/v1/wiki/page?path=index.md"
 ```
 
+#### 手动触发一次自动整理
+
+```bash
+# 默认只整理今天之前的未归档片段，并刷新 Memory Wiki
+curl -X POST http://localhost:8000/v1/maintenance/run_once \
+  -H "Content-Type: application/json" \
+  -d '{"trigger": "manual"}'
+
+# 查看维护状态
+curl http://localhost:8000/v1/maintenance/status | python3 -m json.tool
+```
+
 ---
 
 ## 🧪 测试
@@ -475,6 +493,9 @@ python3 test_api.py
 # v1.7 - Memory Wiki
 python3 -m unittest test_memory_wiki.py -v
 
+# v1.8 - 自动归档与 Wiki 刷新
+python3 -m unittest test_maintenance.py -v
+
 # 科学评测 - 30 轮
 python3 run_benchmark.py
 
@@ -493,6 +514,7 @@ python3 experiment/runner.py
 - **ECharts 实时图表**——记忆构成饼图 + 权重分布对数柱状图
 - **记忆树查看**——按用户、Agent、项目、虚拟 `.mem` 文件浏览原始记忆
 - **Memory Wiki**——从现有记忆和每日片段生成 Markdown 页面，并在 Web 端查看
+- **自动整理状态**——展示每日归档与 Wiki 刷新的运行状态，并可手动触发补账整理
 - **系统指标卡片**——有效记忆数、风险锁定率、今日剪枝数
 
 ---
@@ -545,6 +567,29 @@ httpx>=0.28.0       # 仅客户端工具需要
 ---
 
 ## 📋 更新日志
+
+### v1.8.0 (2026-07-24) — 自动归档与 Wiki 刷新
+
+**新增特性**
+- **自动维护器默认开启**：服务启动后自动执行一次补账扫描，运行中每隔 `MAINTENANCE_INTERVAL_MINUTES` 分钟检查是否有漏归档片段
+- **自愈式每日整理**：即使部署环境在凌晨关机、Docker 重启或单次维护失败，后续启动/周期扫描也会补齐今天之前的未归档 `memory_events`
+- **每日归档规则**：按 `user_id + agent_id + date` 归档，默认跳过当天片段，避免当天对话还未结束就提前打包
+- **Wiki 自动刷新**：每轮维护结束后自动重建 Memory Wiki，让 `/data/wiki` 保持接近最新的可读视图
+- **维护 API**：新增 `GET /v1/maintenance/status` 与 `POST /v1/maintenance/run_once`
+- **Dashboard 维护面板**：新增自动整理状态、下次运行、上次归档统计和“一键整理”按钮
+
+**设计约束**
+- 自动维护不会删除或剪枝长期记忆；它只归档每日片段并刷新 Wiki
+- 维护器使用进程内锁避免并发重复归档；已归档事件天然幂等跳过
+- 某个分组失败时记录错误并继续处理其他分组，不阻断 API 服务
+
+**变更文件**
+- `config.py`: 新增 `AUTO_MAINTENANCE_ENABLED`、`MAINTENANCE_TIME`、`MAINTENANCE_TIMEZONE`、`MAINTENANCE_INTERVAL_MINUTES`
+- `storage/db_manager.py`: 新增未归档事件分组查询
+- `api/main.py`: 新增维护器、后台补账循环、维护状态/手动触发接口，API 版本升至 `1.8.0`
+- `api/static/index.html`: 新增自动整理状态面板
+- `test_maintenance.py`: 新增自动归档、跳过当天、刷新 Wiki 和状态接口测试
+- `README.md`: 更新版本徽章、API 列表、配置项和更新日志
 
 ### v1.7.0 (2026-07-24) — OpenWiki 风格 Memory Wiki
 
