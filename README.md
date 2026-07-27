@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688.svg)](https://fastapi.tiangolo.com/)
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg)](https://www.docker.com/)
-[![Version](https://img.shields.io/badge/release-v1.8.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.8.0)
+[![Version](https://img.shields.io/badge/release-v1.9.0-FF6F00.svg)](https://github.com/DEVRodge/4D-BioMem/releases/tag/v1.9.0)
 
 **4D-BioMem** 是一个受生物突触机制启发的 Agent 长效记忆系统。它模拟人脑的"新陈代谢"——记忆有强弱之分，高频使用的记忆被强化，低频噪声被物理抹除，安全底线永久锁定。
 
@@ -377,6 +377,11 @@ curl -s "http://localhost:8000/v1/memory/list" -G -d user_id=hermes | python3 -m
 | `GET` | `/v1/wiki/page` | 读取单个 Wiki Markdown 页面内容 |
 | `GET` | `/v1/maintenance/status` | 查看自动整理状态、下次运行时间和上次维护结果 |
 | `POST` | `/v1/maintenance/run_once` | 手动触发一次补账整理：归档历史片段并刷新 Wiki |
+| `POST` | `/v1/connectors/register` | 注册或更新连接器配置 |
+| `GET` | `/v1/connectors` | 列出连接器 |
+| `POST` | `/v1/connectors/run` | 运行指定连接器，将外部来源导入每日片段 |
+| `GET` | `/v1/connectors/runs` | 查看连接器运行历史 |
+| `POST` | `/v1/connectors/ingest` | 外部工具直接推送标准化片段，带 source 去重 |
 | `GET` | `/v1/monitor/cells` | 全量细胞实时监控 |
 | `POST` | `/v1/monitor/system_status` | 系统整体指标 |
 | `GET` | `/dashboard/` | 可视化监控面板 |
@@ -471,6 +476,61 @@ curl -X POST http://localhost:8000/v1/maintenance/run_once \
 curl http://localhost:8000/v1/maintenance/status | python3 -m json.tool
 ```
 
+#### 注册并运行文件连接器
+
+```bash
+curl -X POST http://localhost:8000/v1/connectors/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "local-inbox",
+    "name": "Local Inbox",
+    "connector_type": "filesystem",
+	    "config": {
+	      "path": "/data/inbox",
+	      "user_id": "hermes",
+	      "agent_id": "filesystem",
+	      "project": "4D-BioMem",
+	      "max_files": 200,
+	      "max_items": 500,
+	      "max_file_bytes": 262144
+	    }
+	  }'
+
+curl -X POST http://localhost:8000/v1/connectors/run \
+  -H "Content-Type: application/json" \
+  -d '{"connector_id": "local-inbox"}'
+```
+
+#### Hermes 手动推送标准化片段
+
+```bash
+# 直推前也需要先注册连接器，避免错误 connector_id 污染生产记忆库
+curl -X POST http://localhost:8000/v1/connectors/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "hermes-manual",
+    "name": "Hermes Manual",
+    "connector_type": "hermes_manual",
+    "config": {"user_id": "hermes", "agent_id": "hermes"}
+  }'
+
+curl -X POST http://localhost:8000/v1/connectors/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "connector_id": "hermes-manual",
+    "items": [{
+      "user_id": "hermes",
+      "agent_id": "hermes",
+      "content": "用户确认 v1.9 先做本机连接器层",
+      "event_type": "decision",
+      "source": "hermes_manual",
+      "source_id": "decision-2026-07-27-v1.9",
+      "occurred_at": "2026-07-27T09:30:00+08:00",
+      "task_tags": {"project": "4D-BioMem"}
+    }]
+  }'
+```
+
 ---
 
 ## 🧪 测试
@@ -495,6 +555,9 @@ python3 -m unittest test_memory_wiki.py -v
 
 # v1.8 - 自动归档与 Wiki 刷新
 python3 -m unittest test_maintenance.py -v
+
+# v1.9 - 连接器摄取层
+python3 -m unittest test_connectors.py -v
 
 # 科学评测 - 30 轮
 python3 run_benchmark.py
@@ -528,7 +591,8 @@ python3 experiment/runner.py
 │   ├── memory_cell.py          MemoryCell + SynapticPruningEngine
 │   ├── retrieval.py             DualPathwayRetriever（双通路检索）
 │   ├── llm_auditor.py           OpenAILLMAuditor + Mock（自动降级）
-│   └── memory_wiki.py           Memory Wiki Markdown 派生层
+│   ├── memory_wiki.py           Memory Wiki Markdown 派生层
+│   └── connectors.py            文件 / Git 连接器抽取
 ├── storage/
 │   └── db_manager.py            DBManager（SQLite + 向量库，线程安全）
 ├── api/
@@ -538,7 +602,7 @@ python3 experiment/runner.py
 │   └── hermes_tools.py          Hermes Agent 独立工具（httpx 直连）
 ├── experiment/                   A/B/C 三组对照组实验框架
 ├── test_core.py / test_storage.py / test_retrieval.py
-├── test_api.py / test_memory_wiki.py / run_benchmark.py
+├── test_api.py / test_memory_wiki.py / test_connectors.py / run_benchmark.py
 ├── requirements.txt             依赖清单
 ├── Dockerfile / docker-compose.yml / .env.example
 └── SPEC.md                      技术规格说明书
@@ -567,6 +631,31 @@ httpx>=0.28.0       # 仅客户端工具需要
 ---
 
 ## 📋 更新日志
+
+### v1.9.0 (2026-07-27) — 连接器摄取层
+
+**新增特性**
+- **连接器注册表**：新增 `memory_connectors` 表，保存连接器类型、配置、启用状态和更新时间
+- **连接器运行历史**：新增 `connector_runs` 表，记录每次同步的状态、导入数、跳过数、错误和详情
+- **事件来源元数据**：`memory_events` 新增 `source`、`source_id`、`connector_id`，用于追踪外部来源
+- **幂等去重**：同一 `connector_id + source + source_id` 重复导入会跳过，避免连接器反复同步造成重复片段
+- **稳定来源身份**：文件连接器默认用相对根目录路径 + 内容 hash 生成 `source_id`，减少 Docker 挂载路径变化造成的重复导入
+- **安全运行限制**：文件连接器支持 `max_files`、`max_items`、`max_file_bytes`，Git 连接器限制 `max_commits` 并带超时
+- **首批连接器**：支持 `filesystem`、`git`、`hermes_manual`；直推接口要求连接器已注册且启用
+- **连接器 API**：新增 `POST /v1/connectors/register`、`GET /v1/connectors`、`POST /v1/connectors/run`、`GET /v1/connectors/runs`、`POST /v1/connectors/ingest`
+
+**设计约束**
+- 连接器只写入 `memory_events`，不直接写长期 `memory_cells`
+- 连接器身份字段必须非空；旧库若存在重复 source 身份，迁移会保留事件并重写后续重复项的 `source_id`
+- v1.9 不引入 Gmail/Notion/OAuth；先把本机文件、Git 和 Hermes 推送入口做稳
+- 连接器失败只记录运行状态，不影响主 API 服务
+
+**变更文件**
+- `core/connectors.py`: 新增文件和 Git 连接器抽取器
+- `storage/db_manager.py`: 新增连接器表、运行历史、source 元数据和幂等事件写入
+- `api/main.py`: 新增连接器 API，API 版本升至 `1.9.0`
+- `test_connectors.py`: 新增连接器存储、抽取、API 和去重测试
+- `README.md`: 更新版本徽章、API 列表、使用示例和更新日志
 
 ### v1.8.0 (2026-07-24) — 自动归档与 Wiki 刷新
 

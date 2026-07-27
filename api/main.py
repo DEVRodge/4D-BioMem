@@ -16,6 +16,11 @@
   GET  /v1/wiki/page        读取单个 Wiki 页面内容
   GET  /v1/maintenance/status 自动维护状态
   POST /v1/maintenance/run_once 手动触发一次补账整理
+  POST /v1/connectors/register 注册或更新外部连接器
+  GET  /v1/connectors       列出连接器
+  POST /v1/connectors/ingest 外部连接器直接推送标准化片段
+  POST /v1/connectors/run   运行已注册连接器并写入每日片段
+  GET  /v1/connectors/runs  查看连接器运行历史
   GET  /health              健康检查
 
 LLM/Embedding 默认用 Mock（无需 API Key）；设置 LLM_BACKEND=openai + OPENAI_API_KEY 启用 OpenAI。
@@ -40,6 +45,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from config import settings
+from core.connectors import extract_connector_items
 from core.retrieval import DualPathwayRetriever
 from core.llm_auditor import OpenAIEmbedder, OpenAILLMAuditor, MockEmbedder, MockLLMAuditor
 from core.memory_cell import RISK_LOCKED_WEIGHT, MemoryCell, SynapticPruningEngine
@@ -540,6 +546,46 @@ class AppState:
                 "error": str(exc),
             }
 
+    def ingest_connector_items(
+        self,
+        *,
+        connector_id: str,
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """把标准化连接器片段写入 memory_events，并按 source 身份去重。"""
+        if self.db is None:
+            raise RuntimeError("service not ready")
+        imported = []
+        skipped = []
+        for item in items:
+            occurred_at = item.get("occurred_at")
+            if isinstance(occurred_at, str) and occurred_at:
+                occurred = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
+            else:
+                occurred = occurred_at
+            event = self.db.save_event(
+                user_id=item["user_id"],
+                agent_id=item.get("agent_id") or "connector",
+                content=item["content"],
+                event_type=item.get("event_type") or "connector",
+                task_tags=item.get("task_tags"),
+                occurred_at=occurred,
+                connector_id=connector_id,
+                source=item["source"],
+                source_id=item["source_id"],
+            )
+            if event.get("duplicate"):
+                skipped.append(event)
+            else:
+                imported.append(event)
+        return {
+            "connector_id": connector_id,
+            "imported_count": len(imported),
+            "skipped_count": len(skipped),
+            "imported": imported,
+            "skipped": skipped,
+        }
+
     async def _ingestion_worker(self) -> None:
         """后台消费者：从队列取 (req_id, user_id, agent_id, content, user_tags)，跑审计 → save_memory。"""
         assert self.db is not None and self.write_queue is not None
@@ -614,6 +660,34 @@ class MaintenanceRunRequest(BaseModel):
     today: str | None = None
 
 
+class ConnectorRegisterRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1)
+    connector_type: str = Field(min_length=1)
+    config: dict | None = None
+    enabled: bool = True
+
+
+class ConnectorItem(BaseModel):
+    user_id: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    agent_id: str | None = None
+    event_type: str = "connector"
+    task_tags: dict | None = None
+    occurred_at: datetime | None = None
+    source: str = Field(min_length=1)
+    source_id: str = Field(min_length=1)
+
+
+class ConnectorIngestRequest(BaseModel):
+    connector_id: str = Field(min_length=1)
+    items: list[ConnectorItem]
+
+
+class ConnectorRunRequest(BaseModel):
+    connector_id: str = Field(min_length=1)
+
+
 class RetrieveRequest(BaseModel):
     user_id: str
     query: str
@@ -637,6 +711,13 @@ class PruneRequest(BaseModel):
     lambda_: float = DEFAULT_LAMBDA
     theta_prune: float = DEFAULT_THETA
     simulate_days: float = 0.0  # 模拟额外流逝的天数（加速衰减）
+
+
+def _non_empty(value: str | None, field_name: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        raise HTTPException(400, f"{field_name} must be a non-empty string")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +772,7 @@ def create_app(
         finally:
             await state.shutdown()
 
-    app = FastAPI(title="4D-BioMem API", version="1.8.0", lifespan=lifespan)
+    app = FastAPI(title="4D-BioMem API", version="1.9.0", lifespan=lifespan)
     app.state.state = state
     _register_routes(app, state)
     # 前端看板静态资源挂载在 /dashboard（访问 /dashboard 即打开 index.html）
@@ -876,6 +957,123 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
             include_today=req.include_today,
             today=req.today,
         )
+
+    @app.post("/v1/connectors/register", dependencies=[Depends(verify_api_key)])
+    async def connector_register(req: ConnectorRegisterRequest) -> dict:
+        """注册或更新连接器。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        try:
+            connector = state.db.register_connector(
+                connector_id=_non_empty(req.id, "connector_id") if req.id is not None else None,
+                name=_non_empty(req.name, "name"),
+                connector_type=_non_empty(req.connector_type, "connector_type"),
+                config=req.config,
+                enabled=req.enabled,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"status": "registered", "connector": connector}
+
+    @app.get("/v1/connectors", dependencies=[Depends(verify_api_key)])
+    async def connector_list(enabled: bool | None = None) -> dict:
+        """列出连接器。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        items = state.db.list_connectors(enabled=enabled)
+        return {"count": len(items), "items": items}
+
+    @app.post("/v1/connectors/ingest", dependencies=[Depends(verify_api_key)])
+    async def connector_ingest(req: ConnectorIngestRequest) -> dict:
+        """外部连接器直接推送标准化片段。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        connector_id = _non_empty(req.connector_id, "connector_id")
+        connector = state.db.get_connector(connector_id)
+        if connector is None:
+            raise HTTPException(404, "connector not found")
+        if not connector["enabled"]:
+            raise HTTPException(400, "connector is disabled")
+        started = datetime.now(tz=timezone.utc)
+        try:
+            result = state.ingest_connector_items(
+                connector_id=connector_id,
+                items=[
+                    item.model_dump() if hasattr(item, "model_dump") else item.dict()
+                    for item in req.items
+                ],
+            )
+            run = state.db.record_connector_run(
+                connector_id=connector_id,
+                status="completed",
+                imported_count=result["imported_count"],
+                skipped_count=result["skipped_count"],
+                details={"mode": "direct_ingest"},
+                started_at=started,
+                finished_at=datetime.now(tz=timezone.utc),
+            )
+            return {"status": "completed", "run": run, **result}
+        except Exception as exc:  # noqa: BLE001
+            run = state.db.record_connector_run(
+                connector_id=connector_id,
+                status="failed",
+                error=str(exc),
+                details={"mode": "direct_ingest"},
+                started_at=started,
+                finished_at=datetime.now(tz=timezone.utc),
+            )
+            raise HTTPException(400, {"error": str(exc), "run": run}) from exc
+
+    @app.post("/v1/connectors/run", dependencies=[Depends(verify_api_key)])
+    async def connector_run(req: ConnectorRunRequest) -> dict:
+        """运行一个已注册连接器。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        connector_id = _non_empty(req.connector_id, "connector_id")
+        connector = state.db.get_connector(connector_id)
+        if connector is None:
+            raise HTTPException(404, "connector not found")
+        if not connector["enabled"]:
+            raise HTTPException(400, "connector is disabled")
+        started = datetime.now(tz=timezone.utc)
+        try:
+            items = await asyncio.to_thread(
+                extract_connector_items,
+                connector["connector_type"],
+                connector["config"],
+            )
+            result = state.ingest_connector_items(connector_id=connector_id, items=items)
+            run = state.db.record_connector_run(
+                connector_id=connector_id,
+                status="completed",
+                imported_count=result["imported_count"],
+                skipped_count=result["skipped_count"],
+                details={"extracted_count": len(items), "connector_type": connector["connector_type"]},
+                started_at=started,
+                finished_at=datetime.now(tz=timezone.utc),
+            )
+            return {"status": "completed", "run": run, **result}
+        except Exception as exc:  # noqa: BLE001
+            run = state.db.record_connector_run(
+                connector_id=connector_id,
+                status="failed",
+                error=str(exc),
+                details={"connector_type": connector["connector_type"]},
+                started_at=started,
+                finished_at=datetime.now(tz=timezone.utc),
+            )
+            raise HTTPException(400, {"error": str(exc), "run": run}) from exc
+
+    @app.get("/v1/connectors/runs", dependencies=[Depends(verify_api_key)])
+    async def connector_runs(connector_id: str | None = None, limit: int = 100) -> dict:
+        """列出连接器运行历史。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        items = state.db.list_connector_runs(
+            connector_id=connector_id,
+            limit=max(1, min(limit, 1000)),
+        )
+        return {"count": len(items), "items": items}
 
     @app.post("/v1/memory/retrieve", dependencies=[Depends(verify_api_key)])
     async def retrieve_memory(req: RetrieveRequest) -> dict:

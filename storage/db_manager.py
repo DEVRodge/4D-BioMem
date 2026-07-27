@@ -50,6 +50,13 @@ def _to_list(vector) -> list[float]:
     return [float(x) for x in vector]
 
 
+def _clean_required_text(value: str | None, field_name: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return text
+
+
 # ---------------------------------------------------------------------------
 # ChromaDB 实现（首选）
 # ---------------------------------------------------------------------------
@@ -187,7 +194,32 @@ CREATE TABLE IF NOT EXISTS memory_events (
     created_at       TEXT NOT NULL,
     occurred_at      TEXT NOT NULL,
     archived         INTEGER NOT NULL DEFAULT 0,
-    archive_cell_id  TEXT
+    archive_cell_id  TEXT,
+    source           TEXT,
+    source_id        TEXT,
+    connector_id     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memory_connectors (
+    id               TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    connector_type   TEXT NOT NULL,
+    config           TEXT,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS connector_runs (
+    id               TEXT PRIMARY KEY,
+    connector_id     TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    started_at       TEXT NOT NULL,
+    finished_at      TEXT NOT NULL,
+    imported_count   INTEGER NOT NULL DEFAULT 0,
+    skipped_count    INTEGER NOT NULL DEFAULT 0,
+    error            TEXT,
+    details          TEXT
 );
 """
 
@@ -202,8 +234,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 _INSERT_EVENT_SQL = """
 INSERT INTO memory_events
     (id, user_id, agent_id, content, event_type, task_tags,
-     created_at, occurred_at, archived, archive_cell_id)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     created_at, occurred_at, archived, archive_cell_id, source, source_id, connector_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -265,10 +297,70 @@ class DBManager:
             created_at       TEXT NOT NULL,
             occurred_at      TEXT NOT NULL,
             archived         INTEGER NOT NULL DEFAULT 0,
-            archive_cell_id  TEXT
+            archive_cell_id  TEXT,
+            source           TEXT,
+            source_id        TEXT,
+            connector_id     TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_connectors (
+            id               TEXT PRIMARY KEY,
+            name             TEXT NOT NULL,
+            connector_type   TEXT NOT NULL,
+            config           TEXT,
+            enabled          INTEGER NOT NULL DEFAULT 1,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS connector_runs (
+            id               TEXT PRIMARY KEY,
+            connector_id     TEXT NOT NULL,
+            status           TEXT NOT NULL,
+            started_at       TEXT NOT NULL,
+            finished_at      TEXT NOT NULL,
+            imported_count   INTEGER NOT NULL DEFAULT 0,
+            skipped_count    INTEGER NOT NULL DEFAULT 0,
+            error            TEXT,
+            details          TEXT
         );
         """)
+        event_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(memory_events)")}
+        for column in ("source", "source_id", "connector_id"):
+            if column not in event_columns:
+                self._conn.execute(f"ALTER TABLE memory_events ADD COLUMN {column} TEXT")
+        self._deduplicate_connector_event_identities()
+        self._conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_connector_source
+        ON memory_events (connector_id, source, source_id)
+        WHERE connector_id IS NOT NULL AND source IS NOT NULL AND source_id IS NOT NULL
+        """)
         self._conn.commit()
+
+    def _deduplicate_connector_event_identities(self) -> None:
+        """让早期重复连接器身份在建唯一索引前变为可索引状态，不删除事件内容。"""
+        duplicate_groups = self._conn.execute(
+            """
+            SELECT connector_id, source, source_id, COUNT(*) AS n
+            FROM memory_events
+            WHERE connector_id IS NOT NULL AND source IS NOT NULL AND source_id IS NOT NULL
+            GROUP BY connector_id, source, source_id
+            HAVING n > 1
+            """
+        ).fetchall()
+        for group in duplicate_groups:
+            rows = self._conn.execute(
+                """SELECT id, source_id
+                   FROM memory_events
+                   WHERE connector_id = ? AND source = ? AND source_id = ?
+                   ORDER BY created_at ASC, id ASC""",
+                (group["connector_id"], group["source"], group["source_id"]),
+            ).fetchall()
+            for row in rows[1:]:
+                self._conn.execute(
+                    "UPDATE memory_events SET source_id = ? WHERE id = ?",
+                    (f"{row['source_id']}#duplicate:{row['id']}", row["id"]),
+                )
 
     # ---- Dual-Write --------------------------------------------------------
 
@@ -403,6 +495,9 @@ class DBManager:
         task_tags: dict | None = None,
         occurred_at: datetime | None = None,
         event_id: str | None = None,
+        source: str | None = None,
+        source_id: str | None = None,
+        connector_id: str | None = None,
     ) -> dict[str, Any]:
         """保存一条每日片段事件。
 
@@ -410,6 +505,10 @@ class DBManager:
         """
         if self._closed:
             raise RuntimeError("DBManager 已关闭")
+        if any(value is not None for value in (connector_id, source, source_id)):
+            connector_id = _clean_required_text(connector_id, "connector_id")
+            source = _clean_required_text(source, "source")
+            source_id = _clean_required_text(source_id, "source_id")
         now = datetime.now(tz=timezone.utc)
         occurred = occurred_at or now
         row = (
@@ -423,17 +522,57 @@ class DBManager:
             occurred.isoformat(),
             0,
             None,
+            source,
+            source_id,
+            connector_id,
         )
         with self._lock:
-            self._conn.execute(_INSERT_EVENT_SQL, row)
-            self._conn.commit()
-        return self._event_row_to_dict(self._get_event_row(row[0]))
+            if connector_id and source and source_id:
+                existing = self._conn.execute(
+                    """SELECT * FROM memory_events
+                       WHERE connector_id = ? AND source = ? AND source_id = ?""",
+                    (connector_id, source, source_id),
+                ).fetchone()
+                if existing is not None:
+                    event = self._event_row_to_dict(existing)
+                    event["duplicate"] = True
+                    return event
+            try:
+                self._conn.execute(_INSERT_EVENT_SQL, row)
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                if connector_id and source and source_id:
+                    existing = self._conn.execute(
+                        """SELECT * FROM memory_events
+                           WHERE connector_id = ? AND source = ? AND source_id = ?""",
+                        (connector_id, source, source_id),
+                    ).fetchone()
+                    if existing is not None:
+                        event = self._event_row_to_dict(existing)
+                        event["duplicate"] = True
+                        return event
+                raise
+            inserted = self._conn.execute("SELECT * FROM memory_events WHERE id = ?", (row[0],)).fetchone()
+        event = self._event_row_to_dict(inserted)
+        event["duplicate"] = False
+        return event
 
     def _get_event_row(self, event_id: str) -> sqlite3.Row:
         row = self._conn.execute("SELECT * FROM memory_events WHERE id = ?", (event_id,)).fetchone()
         if row is None:
             raise KeyError(f"memory event not found: {event_id}")
         return row
+
+    def _get_event_by_source_identity(
+        self, connector_id: str, source: str, source_id: str
+    ) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                """SELECT * FROM memory_events
+                   WHERE connector_id = ? AND source = ? AND source_id = ?""",
+                (connector_id, source, source_id),
+            ).fetchone()
 
     def _event_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -447,6 +586,9 @@ class DBManager:
             "occurred_at": row["occurred_at"],
             "archived": bool(row["archived"]),
             "archive_cell_id": row["archive_cell_id"],
+            "source": row["source"] if "source" in row.keys() else None,
+            "source_id": row["source_id"] if "source_id" in row.keys() else None,
+            "connector_id": row["connector_id"] if "connector_id" in row.keys() else None,
         }
 
     def list_events(
@@ -519,6 +661,157 @@ class DBManager:
             }
             for row in rows
         ]
+
+    # ---- Connectors ------------------------------------------------------
+
+    def register_connector(
+        self,
+        *,
+        connector_id: str | None = None,
+        name: str,
+        connector_type: str,
+        config: dict | None = None,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """注册或更新一个连接器配置。"""
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        cid = _clean_required_text(connector_id, "connector_id") if connector_id is not None else str(uuid.uuid4())
+        name = _clean_required_text(name, "name")
+        connector_type = _clean_required_text(connector_type, "connector_type")
+        now = datetime.now(tz=timezone.utc).isoformat()
+        config_json = json.dumps(config or {}, ensure_ascii=False)
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT created_at FROM memory_connectors WHERE id = ?", (cid,)
+            ).fetchone()
+            created_at = existing["created_at"] if existing else now
+            self._conn.execute(
+                """INSERT OR REPLACE INTO memory_connectors
+                   (id, name, connector_type, config, enabled, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (cid, name, connector_type, config_json, int(enabled), created_at, now),
+            )
+            self._conn.commit()
+        return self.get_connector(cid)
+
+    def get_connector(self, connector_id: str) -> dict[str, Any] | None:
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM memory_connectors WHERE id = ?", (connector_id,)
+            ).fetchone()
+        return self._connector_row_to_dict(row) if row else None
+
+    def _connector_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "connector_type": row["connector_type"],
+            "config": json.loads(row["config"]) if row["config"] else {},
+            "enabled": bool(row["enabled"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_connectors(self, *, enabled: bool | None = None) -> list[dict[str, Any]]:
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        clauses = []
+        params: list[Any] = []
+        if enabled is not None:
+            clauses.append("enabled = ?")
+            params.append(1 if enabled else 0)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM memory_connectors {where} ORDER BY created_at ASC, id ASC",
+                tuple(params),
+            ).fetchall()
+        return [self._connector_row_to_dict(row) for row in rows]
+
+    def record_connector_run(
+        self,
+        *,
+        connector_id: str,
+        status: str,
+        imported_count: int = 0,
+        skipped_count: int = 0,
+        error: str | None = None,
+        details: dict | None = None,
+        run_id: str | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """记录一次连接器同步结果。"""
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        connector_id = _clean_required_text(connector_id, "connector_id")
+        started = started_at or datetime.now(tz=timezone.utc)
+        finished = finished_at or datetime.now(tz=timezone.utc)
+        rid = run_id or str(uuid.uuid4())
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO connector_runs
+                   (id, connector_id, status, started_at, finished_at,
+                    imported_count, skipped_count, error, details)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    rid,
+                    connector_id,
+                    status,
+                    started.isoformat(),
+                    finished.isoformat(),
+                    int(imported_count),
+                    int(skipped_count),
+                    error,
+                    json.dumps(details or {}, ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+        return self._connector_run_row_to_dict(self._get_connector_run_row(rid))
+
+    def _get_connector_run_row(self, run_id: str) -> sqlite3.Row:
+        row = self._conn.execute("SELECT * FROM connector_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"connector run not found: {run_id}")
+        return row
+
+    def _connector_run_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "connector_id": row["connector_id"],
+            "status": row["status"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "imported_count": int(row["imported_count"]),
+            "skipped_count": int(row["skipped_count"]),
+            "error": row["error"],
+            "details": json.loads(row["details"]) if row["details"] else {},
+        }
+
+    def list_connector_runs(
+        self,
+        *,
+        connector_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        clauses = []
+        params: list[Any] = []
+        if connector_id:
+            clauses.append("connector_id = ?")
+            params.append(connector_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM connector_runs {where} ORDER BY started_at DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [self._connector_run_row_to_dict(row) for row in rows]
 
     def mark_events_archived(self, event_ids: list[str], archive_cell_id: str) -> None:
         """把片段标记为已归档，并关联生成的长期记忆 cell。"""
