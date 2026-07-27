@@ -202,18 +202,91 @@ OPENAI_EMBEDDING_MODEL=text-embedding-v2
 
 ```bash
 # 1. 克隆项目
-git clone https://github.com/your-username/4D-BioMem.git
+git clone https://github.com/DEVRodge/4D-BioMem.git
 cd 4D-BioMem
 
-# 2. 配置（可选：设一个 API Key 保护服务）
+# 2. 固定到 v1.9.0（生产部署建议显式指定 tag）
+git fetch --tags
+git checkout v1.9.0
+
+# 3. 配置（可选：设一个 API Key 保护服务）
 cp .env.example .env
 # 编辑 .env 设置 API_KEY，留空则不启用鉴权
 
-# 3. 启动
-docker compose up -d
+# 4. 启动
+docker compose up -d --build
 
-# 4. 验证
+# 5. 验证
 curl http://localhost:8000/health
+curl http://localhost:8000/openapi.json | python3 -c 'import sys,json; print(json.load(sys.stdin)["info"]["version"])'
+```
+
+浏览器打开：
+
+```text
+http://服务器IP:8000/dashboard/
+```
+
+> `docker compose` 提示 `version is obsolete` 只是新版 Compose 对 `version:` 字段的提示，不影响服务启动。
+
+### 国内 Ubuntu 服务器部署提示
+
+国内服务器常见失败点是无法拉取 Docker Hub 的 `python:3.11-slim`，或构建时访问 PyPI 较慢。可以先按 Ubuntu 安装 Docker，然后对 Dockerfile 做一次本地部署适配：
+
+```bash
+# 安装 Docker 后，在项目目录执行
+cp Dockerfile Dockerfile.bak
+
+sed -i 's|FROM python:3.11-slim AS builder|FROM docker.m.daocloud.io/library/python:3.11-slim AS builder|' Dockerfile
+sed -i 's|FROM python:3.11-slim AS runtime|FROM docker.m.daocloud.io/library/python:3.11-slim AS runtime|' Dockerfile
+sed -i 's|RUN pip install --no-cache-dir -r requirements.txt|RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.txt|' Dockerfile
+
+docker compose up -d --build
+```
+
+如果服务器上 `8000` 已被其他服务占用，可在 `.env` 里设置宿主机端口：
+
+```env
+PORT=8001
+```
+
+然后访问 `http://服务器IP:8001/dashboard/`。
+
+### 存储与备份
+
+v1.9 默认不需要额外安装 MySQL、PostgreSQL、Redis、Milvus 或 Qdrant。Docker 部署时所有状态都保存在 Compose volume：
+
+```text
+/data/biomem.db          SQLite 主库
+/data/vector_store.pkl   本地向量索引
+/data/wiki/              Memory Wiki 派生文件
+```
+
+查看 volume：
+
+```bash
+docker volume ls
+docker volume inspect 4d-biomem_biomem_data
+```
+
+备份：
+
+```bash
+docker run --rm \
+  -v 4d-biomem_biomem_data:/data \
+  -v "$PWD":/backup \
+  alpine \
+  tar czf /backup/biomem-data-backup.tar.gz -C /data .
+```
+
+恢复：
+
+```bash
+docker run --rm \
+  -v 4d-biomem_biomem_data:/data \
+  -v "$PWD":/backup \
+  alpine \
+  sh -c "cd /data && tar xzf /backup/biomem-data-backup.tar.gz"
 ```
 
 ### 方式二：直接运行
@@ -294,64 +367,134 @@ recall_memory("用户有什么过敏史")
 
 ## 🤖 Hermes Agent 集成
 
-4D-BioMem 已原生支持 [Hermes Agent](https://github.com/DEVRodge/Hermes-Agent-Self-Evolution) 框架。安装方式：
+4D-BioMem 可与 [Hermes Agent](https://github.com/DEVRodge/Hermes-Agent-Self-Evolution) 配合使用。v1.9 推荐把 Hermes 接入分成两层：
 
-```bash
-# 在 Hermes Agent 的 tools 目录下已有 biomem_tool.py
-# 只需确保 4D-BioMem 服务在运行
-curl http://localhost:8000/health
-# → {"status":"ok", ...}
+- **长期事实层**：明确需要长期记住的事实写入 `/v1/memory/add`，进入 `memory_cells`，参与风险锁定、权重强化和剪枝。
+- **每日片段层**：每轮 Hermes 对话写入 `/v1/connectors/ingest`，进入 `memory_events`，后续由 v1.8 自动维护归档成长期记忆并刷新 Wiki。
+
+### 方式一：HTTP 工具集成
+
+仓库内提供了轻量 HTTP 工具：
+
+```text
+integrations/hermes_tools.py
 ```
 
-### 已注册的工具
-
-Hermes Agent 启动后，大模型自动可使用两个 4D-BioMem 工具：
+它暴露：
 
 | 工具名称 | 功能 | 大模型何时调用 |
 |---------|------|-------------|
-| `biomem_remember` | 存入事实到长效记忆 | 用户说了需要跨会话记住的信息：过敏史、密码、偏好、项目方案等 |
-| `biomem_recall` | 检索历史记忆 | 用户引用过去讨论、需要检查过敏/禁忌、上下文窗口不够时 |
+| `remember_fact` | 写入长期事实到 `memory_cells` | 用户说了需要跨会话记住的信息：过敏史、密码、偏好、项目方案等 |
+| `recall_memory` | 检索长期记忆 | 用户引用过去讨论、需要检查过敏/禁忌、上下文窗口不够时 |
+| `synthesize_memory` | 跨记忆合成问答 | 需要基于多条历史记忆综合回答时 |
+
+配置：
+
+```bash
+export BIOMEM_API_URL=http://localhost:8000
+# 如果 4D-BioMem 开启了 API 鉴权，则设置为服务器 API_KEY
+export BIOMEM_API_KEY=your-key
+export BIOMEM_DEFAULT_USER=hermes
+```
+
+Python 调用示例：
+
+```python
+from integrations import configure, recall_memory, remember_fact
+
+configure(base_url="http://127.0.0.1:8000", default_user="hermes")
+
+remember_fact("我对青霉素过敏，开药务必避开青霉素类")
+recall_memory("我能吃青霉素吗")
+```
+
+### 方式二：v1.9 Connector 每日片段接入
+
+如果希望 Hermes 每轮对话都自动进入“每日片段层”，先注册 `hermes-manual` 连接器：
+
+```bash
+curl -X POST http://localhost:8000/v1/connectors/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "hermes-manual",
+    "name": "Hermes Manual",
+    "connector_type": "hermes_manual",
+    "config": {"user_id": "hermes", "agent_id": "default"}
+  }'
+```
+
+Hermes memory provider 的 `sync_turn(user, assistant, session_id=...)` 应将标准化片段推送到：
+
+```bash
+curl -X POST http://localhost:8000/v1/connectors/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "connector_id": "hermes-manual",
+    "items": [{
+      "user_id": "hermes",
+      "agent_id": "default",
+      "content": "[Hermes对话片段]\n用户: hello\n助手: 你好",
+      "event_type": "conversation_turn",
+      "source": "hermes_memory_provider",
+      "source_id": "session-id:content-hash",
+      "occurred_at": "2026-07-27T12:00:00+08:00",
+      "task_tags": {"project": "Hermes", "type": "conversation_turn"}
+    }]
+  }'
+```
+
+推荐的 Hermes provider 行为：
+
+| Hook / 工具 | 建议写入位置 |
+|------------|--------------|
+| `sync_turn(...)` | `/v1/connectors/ingest` → `memory_events` |
+| `remember_fact(...)` | `/v1/memory/add` → `memory_cells` |
+| `recall_memory(...)` / `prefetch(...)` | `/v1/memory/retrieve` |
+
+### RISK LOCK 注意事项
+
+风险记忆会被 `is_risk=True` 和 `current_weight=INF` 永久锁定，但检索仍遵守 `user_id` / `agent_id` 隔离。生产接入时要确保写入和检索使用同一身份，例如：
+
+```text
+user_id=hermes
+agent_id=default
+```
+
+如果把风险事实写到了 `user_id=demo`，而 Hermes 检索 `user_id=hermes`，模型就不会看到那条风险记忆。过敏史、用药禁忌、凭证等高风险事实建议显式调用 `remember_fact` 写入当前 Hermes 用户的长期记忆。
 
 ### 记忆代谢闭环
 
 ```
-用户说 "我对青霉素过敏" 
-  → Hermes 调 biomem_remember 
+用户说 "我对青霉素过敏"
+  → Hermes 调 remember_fact
     → 4D-BioMem 审计标记为 is_risk=True（永久锁定）
       → 双通路检索时风险记忆始终强制返回 ✓
 
 用户说 "上次那个 Bug 怎么修"
-  → Hermes 调 biomem_recall
+  → Hermes 调 recall_memory
     → 4D-BioMem 双通路唤醒 → 权重排序 Top-K → 返回结果
       → 命中记忆 C_i+=1，突触强化，免于剪枝 ✓
 
-闲聊内容（"今天吃了酸菜鱼"）
-  → 低价值标记 is_risk=False, I=2
-    → 无人检索 → 权重衰减至 θ_prune 以下 → 物理抹除 ✓
-```
-
-### 使用方式
-
-**方式一：直接在 Hermes 对话中告知**
-```
-你对 Hermes 说：
-  → "从现在开始请用 biomem_remember 和 biomem_recall 工具管理我的长期记忆"
-之后 Hermes 的大模型就会自动判断何时存、何时查。
-```
-
-**方式二：环境变量配置**
-
-```bash
-export BIOMEM_API_URL=http://localhost:8000
-# 如果 4D-BioMem 开启了 API 鉴权（未配置则无需设此值）
-export BIOMEM_API_KEY=your-key
+日常对话片段
+  → Hermes provider 调 /v1/connectors/ingest
+    → 进入 memory_events
+      → 自动维护按天归档 → 刷新 Memory Wiki ✓
 ```
 
 ### 验证连通
 
 ```bash
-# 说一句话让 Hermes 存，然后查 4D-BioMem：
+# 服务健康
+curl http://localhost:8000/health
+
+# 长期记忆数量
 curl -s "http://localhost:8000/v1/memory/list" -G -d user_id=hermes | python3 -m json.tool
+
+# Hermes connector 运行历史
+curl -s "http://localhost:8000/v1/connectors/runs?connector_id=hermes-manual" | python3 -m json.tool
+
+# 每日片段
+curl -s "http://localhost:8000/v1/memory/events?user_id=hermes&archived=false" | python3 -m json.tool
 ```
 
 ---
