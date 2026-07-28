@@ -398,8 +398,13 @@ class AppState:
         agent_id: str,
         date: str,
         task_tags: dict | None = None,
+        atomize: bool = False,
     ) -> dict[str, Any]:
-        """把一个 user/agent/date 的未归档片段聚合为长期记忆。"""
+        """把一个 user/agent/date 的未归档片段聚合为长期记忆。
+
+        atomize=True 时额外把每条事件写成独立的 atomic_memory，便于后续
+        细粒度召回；daily_archive 仍保留作为当天可读摘要。
+        """
         if self.db is None:
             raise RuntimeError("service not ready")
         events = self.db.list_events(
@@ -444,6 +449,38 @@ class AppState:
         )
         cell.current_weight = cell.compute_weight(now, DEFAULT_LAMBDA)
         self.db.save_memory(cell, vector)
+        atomic_cell_ids: list[str] = []
+        if atomize:
+            for event in events:
+                event_content = str(event["content"]).strip()
+                if not event_content:
+                    continue
+                event_audit = await self.auditor.audit(event_content)
+                event_tags = {
+                    **event_audit["task_tags"],
+                    **event.get("task_tags", {}),
+                    "type": "atomic_memory",
+                    "date": date,
+                    "source": "memory_events",
+                    "event_id": event["id"],
+                    "archive_cell_id": cell.id,
+                }
+                event_vector = await self.embedder.embed(event_content)
+                atomic_cell = MemoryCell(
+                    content=event_content,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    is_risk=bool(event_audit["is_risk"]),
+                    base_intensity=float(event_audit["base_intensity"]),
+                    created_at=now,
+                    last_accessed_at=now,
+                    task_tags=event_tags,
+                    entities=event_audit.get("entities", []),
+                    id=str(uuid.uuid4()),
+                )
+                atomic_cell.current_weight = atomic_cell.compute_weight(now, DEFAULT_LAMBDA)
+                self.db.save_memory(atomic_cell, event_vector)
+                atomic_cell_ids.append(atomic_cell.id)
         self.db.mark_events_archived([event["id"] for event in events], cell.id)
         return {
             "status": "archived",
@@ -452,6 +489,7 @@ class AppState:
             "date": date,
             "event_count": len(events),
             "archive_cell_id": cell.id,
+            "atomic_cell_ids": atomic_cell_ids,
             "content": content,
         }
 
@@ -647,6 +685,7 @@ class ArchiveDayRequest(BaseModel):
     date: str
     agent_id: str | None = None
     task_tags: dict | None = None
+    atomize: bool = False
 
 
 class WikiBuildRequest(BaseModel):
@@ -695,6 +734,7 @@ class RetrieveRequest(BaseModel):
     query_tags: dict | None = None  # F 轴过滤：指定则通路A仅返回标签匹配的非风险记忆
     query_entities: list[dict] | None = None  # 实体检索：通路B对命中实体做 score boost
     agent_id: str | None = None  # 指定则只检索该 agent 的记忆（不传则不过滤）
+    include_trace: bool = False  # 返回检索路径、分数构成和候选选择过程
 
 
 class SynthesizeRequest(BaseModel):
@@ -711,6 +751,14 @@ class PruneRequest(BaseModel):
     lambda_: float = DEFAULT_LAMBDA
     theta_prune: float = DEFAULT_THETA
     simulate_days: float = 0.0  # 模拟额外流逝的天数（加速衰减）
+
+
+class MemoryFeedbackRequest(BaseModel):
+    user_id: str = Field(min_length=1)
+    memory_id: str = Field(min_length=1)
+    feedback: str = Field(min_length=1)
+    note: str | None = None
+    agent_id: str | None = None
 
 
 def _non_empty(value: str | None, field_name: str) -> str:
@@ -855,6 +903,7 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
             agent_id=agent_id,
             date=req.date,
             task_tags=req.task_tags,
+            atomize=req.atomize,
         )
 
     @app.get("/v1/memory/list", dependencies=[Depends(verify_api_key)])
@@ -1075,29 +1124,73 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
         )
         return {"count": len(items), "items": items}
 
+    @app.post("/v1/memory/feedback", dependencies=[Depends(verify_api_key)])
+    async def memory_feedback(req: MemoryFeedbackRequest) -> dict:
+        """记录一条记忆反馈：useful / wrong / delete / keep。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        allowed = {"useful", "wrong", "delete", "keep"}
+        feedback = req.feedback.strip().lower()
+        if feedback not in allowed:
+            raise HTTPException(400, f"feedback must be one of {sorted(allowed)}")
+        cell = state.db.get_cell(req.memory_id)
+        if cell is None:
+            raise HTTPException(404, "memory not found")
+        if cell.user_id != req.user_id:
+            raise HTTPException(404, "memory not found")
+        if req.agent_id and cell.agent_id != req.agent_id:
+            raise HTTPException(404, "memory not found")
+        item = state.db.record_feedback(
+            memory_id=req.memory_id,
+            user_id=req.user_id,
+            agent_id=req.agent_id,
+            feedback=feedback,
+            note=req.note,
+        )
+        return {"status": "recorded", "feedback": item}
+
+    @app.get("/v1/memory/feedback", dependencies=[Depends(verify_api_key)])
+    async def memory_feedback_list(
+        user_id: str | None = None,
+        memory_id: str | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """列出记忆反馈记录。"""
+        if state.db is None:
+            raise HTTPException(503, "service not ready")
+        items = state.db.list_feedback(
+            user_id=user_id,
+            memory_id=memory_id,
+            limit=max(1, min(limit, 1000)),
+        )
+        return {"count": len(items), "items": items}
+
     @app.post("/v1/memory/retrieve", dependencies=[Depends(verify_api_key)])
     async def retrieve_memory(req: RetrieveRequest) -> dict:
         """双通路唤醒：A 硬过滤 + B 软匹配 → 去重融合 → access_count += 1。"""
         if state.db is None:
             raise HTTPException(503, "service not ready")
-        hits, pathway_a, pathway_b = await _retrieve_hits(
+        hits, pathway_a, pathway_b, trace = await _retrieve_hits(
             state, req.user_id, req.query, req.top_k,
             query_tags=req.query_tags, query_entities=req.query_entities,
-            agent_id=req.agent_id,
+            agent_id=req.agent_id, include_trace=req.include_trace,
         )
-        return {
+        response = {
             "user_id": req.user_id,
             "query": req.query,
             "hits": hits,
             "pathways": {"A": len(pathway_a), "B": len(pathway_b)},
         }
+        if req.include_trace:
+            response["trace"] = trace
+        return response
 
     @app.post("/v1/memory/synthesize", dependencies=[Depends(verify_api_key)])
     async def synthesize_memory(req: SynthesizeRequest) -> dict:
         """跨记忆合成：检索 Top-K → LLM 综合回答（Mock 模式返回拼接摘要）。"""
         if state.db is None:
             raise HTTPException(503, "service not ready")
-        hits, _, _ = await _retrieve_hits(
+        hits, _, _, _ = await _retrieve_hits(
             state, req.user_id, req.question, req.top_k,
             query_tags=req.query_tags, query_entities=req.query_entities,
             agent_id=req.agent_id,
@@ -1255,7 +1348,8 @@ async def _retrieve_hits(
     query_tags: dict | None = None,
     query_entities: list[dict] | None = None,
     agent_id: str | None = None,
-) -> tuple[list[dict], dict[str, MemoryCell], dict[str, float]]:
+    include_trace: bool = False,
+) -> tuple[list[dict], dict[str, MemoryCell], dict[str, float], dict[str, Any] | None]:
     """共享检索逻辑：双通路唤醒 → 去重融合 → 突触强化 → 返回命中列表。
 
     Returns
@@ -1266,13 +1360,13 @@ async def _retrieve_hits(
     now = datetime.now(tz=timezone.utc)
     cells = db.load_cells_by_user(user_id)
     if not cells:
-        return [], {}, {}
+        return [], {}, {}, _empty_trace(user_id, query) if include_trace else None
 
     # agent_id 预过滤
     if agent_id:
         cells = [c for c in cells if c.agent_id == agent_id]
     if not cells:
-        return [], {}, {}
+        return [], {}, {}, _empty_trace(user_id, query) if include_trace else None
 
     query_audit = await state.auditor.audit(query)
     effective_tags = {**query_audit.get("task_tags", {}), **(query_tags or {})}
@@ -1302,6 +1396,7 @@ async def _retrieve_hits(
 
     # ---- API 返回策略：非风险查询保留一个风险常驻槽位，但不让风险抢首位 ----
     selected_hits = _select_api_hits(result.hits, top_k, effective_tags)
+    selected_ids = {hit.cell.id for hit in selected_hits}
     fused: list[dict] = []
     for hit in selected_hits:
         cell = hit.cell
@@ -1330,7 +1425,58 @@ async def _retrieve_hits(
         cell = hit.cell
         db.update_cell(cell)
 
-    return fused, pathway_a, pathway_b
+    trace = None
+    if include_trace:
+        trace = {
+            "user_id": user_id,
+            "query": query,
+            "agent_id": agent_id,
+            "effective_tags": effective_tags,
+            "effective_entities": effective_entities,
+            "candidate_count": len(result.hits),
+            "selected_count": len(selected_hits),
+            "hard_confidence": result.hard_confidence,
+            "soft_activated": result.soft_activated,
+            "hard_hits_count": result.hard_hits_count,
+            "soft_hits_count": result.soft_hits_count,
+            "pathway_counts": {"A": len(pathway_a), "B": len(pathway_b)},
+            "hits": [_trace_hit(hit, selected_ids) for hit in result.hits],
+        }
+
+    return fused, pathway_a, pathway_b, trace
+
+
+def _empty_trace(user_id: str, query: str) -> dict[str, Any]:
+    return {
+        "user_id": user_id,
+        "query": query,
+        "agent_id": None,
+        "effective_tags": {},
+        "effective_entities": [],
+        "candidate_count": 0,
+        "selected_count": 0,
+        "hard_confidence": 0.0,
+        "soft_activated": False,
+        "hard_hits_count": 0,
+        "soft_hits_count": 0,
+        "pathway_counts": {"A": 0, "B": 0},
+        "hits": [],
+    }
+
+
+def _trace_hit(hit, selected_ids: set[str]) -> dict[str, Any]:
+    cell = hit.cell
+    return {
+        "id": cell.id,
+        "agent_id": cell.agent_id,
+        "is_risk": cell.is_risk,
+        "pathways": hit.pathway.split("+"),
+        "score": "INF" if cell.is_risk else round(hit.score, 4),
+        "selected": cell.id in selected_ids,
+        "task_tags": cell.task_tags,
+        "entities": cell.entities,
+        "detail": hit.detail,
+    }
 
 
 def _select_api_hits(hits, top_k: int, query_tags: dict) -> list:

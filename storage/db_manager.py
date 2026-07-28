@@ -221,6 +221,16 @@ CREATE TABLE IF NOT EXISTS connector_runs (
     error            TEXT,
     details          TEXT
 );
+
+CREATE TABLE IF NOT EXISTS memory_feedback (
+    id               TEXT PRIMARY KEY,
+    memory_id        TEXT NOT NULL,
+    user_id          TEXT NOT NULL,
+    agent_id         TEXT,
+    feedback         TEXT NOT NULL,
+    note             TEXT,
+    created_at       TEXT NOT NULL
+);
 """
 
 _INSERT_SQL = """
@@ -324,6 +334,16 @@ class DBManager:
             error            TEXT,
             details          TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS memory_feedback (
+            id               TEXT PRIMARY KEY,
+            memory_id        TEXT NOT NULL,
+            user_id          TEXT NOT NULL,
+            agent_id         TEXT,
+            feedback         TEXT NOT NULL,
+            note             TEXT,
+            created_at       TEXT NOT NULL
+        );
         """)
         event_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(memory_events)")}
         for column in ("source", "source_id", "connector_id"):
@@ -336,6 +356,76 @@ class DBManager:
         WHERE connector_id IS NOT NULL AND source IS NOT NULL AND source_id IS NOT NULL
         """)
         self._conn.commit()
+
+    # ---- Memory Feedback -------------------------------------------------
+
+    def record_feedback(
+        self,
+        *,
+        memory_id: str,
+        user_id: str,
+        feedback: str,
+        note: str | None = None,
+        agent_id: str | None = None,
+        feedback_id: str | None = None,
+        created_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """记录用户或 agent 对某条记忆命中的反馈，用于质量闭环。"""
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        memory_id = _clean_required_text(memory_id, "memory_id")
+        user_id = _clean_required_text(user_id, "user_id")
+        feedback = _clean_required_text(feedback, "feedback")
+        rid = feedback_id or str(uuid.uuid4())
+        created = created_at or datetime.now(tz=timezone.utc)
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO memory_feedback
+                   (id, memory_id, user_id, agent_id, feedback, note, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (rid, memory_id, user_id, agent_id, feedback, note, created.isoformat()),
+            )
+            self._conn.commit()
+            row = self._conn.execute("SELECT * FROM memory_feedback WHERE id = ?", (rid,)).fetchone()
+        return self._feedback_row_to_dict(row)
+
+    def list_feedback(
+        self,
+        *,
+        user_id: str | None = None,
+        memory_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """列出记忆反馈，默认按新到旧排序。"""
+        if self._closed:
+            raise RuntimeError("DBManager 已关闭")
+        clauses = []
+        params: list[Any] = []
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if memory_id:
+            clauses.append("memory_id = ?")
+            params.append(memory_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(limit, 1000)))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM memory_feedback {where} ORDER BY created_at DESC, id DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [self._feedback_row_to_dict(row) for row in rows]
+
+    def _feedback_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "memory_id": row["memory_id"],
+            "user_id": row["user_id"],
+            "agent_id": row["agent_id"],
+            "feedback": row["feedback"],
+            "note": row["note"],
+            "created_at": row["created_at"],
+        }
 
     def _deduplicate_connector_event_identities(self) -> None:
         """让早期重复连接器身份在建唯一索引前变为可索引状态，不删除事件内容。"""
