@@ -509,11 +509,13 @@ curl -s "http://localhost:8000/v1/memory/events?user_id=hermes&archived=false" |
 | `POST` | `/v1/memory/add` | 异步录入记忆（立即返回 queued），支持 `task_tags` 字段 |
 | `POST` | `/v1/memory/ingest_event` | 写入每日片段事件；不会立即进入向量库 |
 | `GET` | `/v1/memory/events` | 列出每日片段事件，支持按用户、日期、归档状态过滤 |
-| `POST` | `/v1/memory/archive_day` | 将某天未归档片段聚合为长期记忆 |
+| `POST` | `/v1/memory/archive_day` | 将某天未归档片段聚合为长期记忆；可选 `atomize=true` 生成原子记忆 |
 | `GET` | `/v1/memory/list` | 列出用户全部记忆 |
 | `GET` | `/v1/memory/tree` | 返回 Web 端记忆树；按用户 / Agent / 项目 / 虚拟 `.mem` 文件分组 |
-| `POST` | `/v1/memory/retrieve` | 双通路唤醒检索，支持 `query_tags` F 轴过滤、`query_entities` 实体 boost、`agent_id` 隔离 |
+| `POST` | `/v1/memory/retrieve` | 双通路唤醒检索，支持 `query_tags` F 轴过滤、`query_entities` 实体 boost、`agent_id` 隔离、`include_trace` 可解释追踪 |
 | `POST` | `/v1/memory/synthesize` | 跨记忆合成问答：检索 Top-K → LLM 综合回答（Mock 模式返回拼接摘要） |
+| `POST` | `/v1/memory/feedback` | 写入记忆反馈：`useful` / `wrong` / `delete` / `keep` |
+| `GET` | `/v1/memory/feedback` | 查询记忆反馈记录 |
 | `POST` | `/v1/memory/prune` | 触发新陈代谢——抹除死亡记忆 |
 | `POST` | `/v1/wiki/build` | 从现有记忆和每日片段生成本地 Markdown Memory Wiki |
 | `GET` | `/v1/wiki/pages` | 列出最近一次生成的 Wiki 页面清单 |
@@ -580,6 +582,47 @@ curl -X POST http://localhost:8000/v1/memory/retrieve \
   }'
 ```
 
+#### 返回检索 trace
+
+```bash
+# 调试某条记忆为什么被召回，以及最终是否进入 API Top-K
+curl -X POST http://localhost:8000/v1/memory/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "hermes",
+    "query": "项目 Alpha Bug 修复",
+    "query_tags": {"project": "Alpha", "type": "tech"},
+    "include_trace": true
+  }'
+```
+
+#### 写入记忆反馈
+
+```bash
+curl -X POST http://localhost:8000/v1/memory/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "hermes",
+    "memory_id": "memory-cell-id",
+    "feedback": "wrong",
+    "note": "这条命中不该出现在 Beta 查询里"
+  }'
+```
+
+#### 原子化每日归档
+
+```bash
+# 同时生成 daily_archive 摘要记忆和每条事件对应的 atomic_memory
+curl -X POST http://localhost:8000/v1/memory/archive_day \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "hermes",
+    "agent_id": "codex",
+    "date": "2026-07-28",
+    "atomize": true
+  }'
+```
+
 #### 跨记忆合成问答
 
 ```bash
@@ -618,6 +661,16 @@ curl -X POST http://localhost:8000/v1/maintenance/run_once \
 # 查看维护状态
 curl http://localhost:8000/v1/maintenance/status | python3 -m json.tool
 ```
+
+## 🚧 下一版开发中
+
+**v2.0 记忆质量闭环基础**
+- **检索 Trace**：`POST /v1/memory/retrieve` 新增 `include_trace`，可返回有效标签、实体、A/B 通路计数、soft 激活状态、候选命中和最终选择状态
+- **记忆反馈 API**：新增 `memory_feedback` 表、`POST /v1/memory/feedback` 和 `GET /v1/memory/feedback`，先记录 `useful` / `wrong` / `delete` / `keep` 反馈，为后续自动调参和治理做数据闭环
+- **原子化归档**：`POST /v1/memory/archive_day` 新增 `atomize` 参数，开启后除 `daily_archive` 外，为每条事件额外生成 `atomic_memory`
+- **测试覆盖**：新增 `test_memory_quality.py`，覆盖 trace、feedback、atomize 三个质量闭环入口
+
+---
 
 #### 注册并运行文件连接器
 
